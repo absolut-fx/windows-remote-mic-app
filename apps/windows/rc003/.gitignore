@@ -3,4 +3,6 @@ __pycache__/
 *.pyc
 build/third_party/
 build/pyinstaller-work/
+# PyInstaller's per-app working dir (created when the .spec is run without --workpath override).
+build/RemoteMicRC003/
 src/ovb_rc003/frida_assets/*.xz
