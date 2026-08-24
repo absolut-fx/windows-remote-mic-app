@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ovb_rc003 import frida_compat
+from ovb_rc003 import device_profile, frida_compat
 
 
 class AssetDescriptorTests(unittest.TestCase):
@@ -125,6 +125,39 @@ class ReportTapTests(unittest.TestCase):
             layer = frida_compat.BackKeyCompatLayer(gadget_path=path, asset=asset)
             self.assertTrue(layer.available)
             self.assertEqual(layer.status, "ready_gadget_verified")
+
+
+class TvNativeKeycodeTests(unittest.TestCase):
+    """Regression coverage for HD838A Bugs/2026-08-22-tv-native-keycode-leak.md.
+
+    The RC003 actually reports the TV button as HID usage 0x0031
+    ("Keyboard 1 and !"), not 0x0035 ("Grave Accent and Tilde") that the
+    upstream table shipped with. If we re-arm the wrong usage the
+    DuplicateSuppressor never matches the real keystroke, the binding still
+    runs, and § leaks onto the foreground app every time TV is pressed.
+
+    These tests pin both halves of the mapping so a future refactor cannot
+    silently regress the fix.
+    """
+
+    def test_tv_button_resolves_to_keyboard_1_usage(self):
+        self.assertEqual(device_profile.BUTTON_USAGE_IDS[0x0031], "tv")
+
+    def test_tv_button_does_not_resolve_to_grave_accent_usage(self):
+        self.assertNotIn(0x0035, device_profile.BUTTON_USAGE_IDS)
+
+    def test_tap_usage_to_key_maps_tv_to_digit_one(self):
+        vk, scan, extended = frida_compat.TAP_USAGE_TO_KEY[0x0031]
+        self.assertEqual(vk, 0x31)  # VK_1
+        self.assertFalse(extended)
+        # The PS/2 Set 1 make-code for "1" on a US keyboard is 0x02.
+        self.assertEqual(scan, 0x02)
+
+    def test_tap_usage_to_button_mirror_tv_to_button_name(self):
+        # TAP_USAGE_TO_BUTTON is built from BUTTON_USAGE_IDS at import time,
+        # so the 0x0031 -> "tv" mapping must propagate.
+        from ovb_rc003.frida_compat import TAP_USAGE_TO_BUTTON
+        self.assertEqual(TAP_USAGE_TO_BUTTON.get(0x0031), "tv")
 
 
 if __name__ == "__main__":

@@ -74,7 +74,7 @@ for _usage, _button in BUTTON_USAGE_IDS.items():
 # vk/scan/extended values whether the arm came from Raw Input or from the tap.
 TAP_USAGE_TO_KEY = {
     0x0028: (0x0D, 0x1C, False),  # ok / Enter
-    0x0035: (0xC0, 0x29, False),  # tv / grave accent
+    0x0031: (0x31, 0x02, False),  # tv / Keyboard 1 and !  (HD838A 2026-08-22 bug)
     0x003E: (0x74, 0x3F, False),  # mic / F5 (voice path, never armed)
     0x004A: (0x24, 0x47, True),  # home
     0x004F: (0x27, 0x4D, True),  # right
