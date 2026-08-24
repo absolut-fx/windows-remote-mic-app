@@ -68,11 +68,21 @@ ApplicationWindow {
             Layout.fillWidth: true
 
             TabButton {
-                objectName: "connectionTabButton"  // test hook: for the rendered contrast regression test
-                text: qsTr("连接")
+                objectName: "generalTabButton"
+                text: qsTr("通用")
                 Accessible.name: text
             }
             TabButton {
+                objectName: "connectionTabButton"  // test hook: for the rendered contrast regression test
+                text: qsTr("连接")
+                Accessible.name: text
+                // Pre-selected so the connection tab is the initial landing page;
+                // preserves the historical "open Settings → land on 连接" UX
+                // even though 通用 is now the leftmost tab.
+                Component.onCompleted: checked = true
+            }
+            TabButton {
+                objectName: "mappingTabButton"
                 text: SettingsController.mappingPageTitle
                 Accessible.name: text
             }
@@ -93,6 +103,7 @@ ApplicationWindow {
             Layout.fillHeight: true
             currentIndex: tabBar.currentIndex
 
+            GeneralPage { tokens: window.tokens }
             ConnectionPage { tokens: window.tokens }
             ButtonsPage { tokens: window.tokens }
             PermissionsPage { tokens: window.tokens }

@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import atexit
 import gc
+import logging
 import sys
 import threading
 from pathlib import Path
@@ -115,9 +116,13 @@ from . import (
     resources,
     settings_ui,
     shell_targets,
+    startup_shortcut,
+    tray_icon,
     vb_cable_bundle,
     windows_diagnostics,
 )
+
+logger = logging.getLogger(__name__)
 
 # These are the reference-style semantic action choices offered in each
 # editable ordinary-button mapping row.  The combo box stays editable (not
@@ -446,6 +451,8 @@ def _load_qt_classes() -> dict:
             Property,
             QAbstractListModel,
             QByteArray,
+            QCoreApplication,
+            QEvent,
             QModelIndex,
             QObject,
             Qt,
@@ -453,9 +460,10 @@ def _load_qt_classes() -> dict:
             Signal,
             Slot,
         )
-        from PySide6.QtGui import QGuiApplication
+        from PySide6.QtGui import QCloseEvent, QGuiApplication
         from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterSingletonInstance
         from PySide6.QtQuickControls2 import QQuickStyle
+        from PySide6.QtWidgets import QApplication
     except ImportError as exc:
         raise QtUnavailableError(
             "PySide6-Essentials 未安装，无法打开 Qt 设置界面。源码运行请先在本项目"
@@ -713,6 +721,13 @@ def _load_qt_classes() -> dict:
         hotkeyCaptureError = Signal(str)
         _hotkeyCaptureResult = Signal(str)
         bridgeRunningChanged = Signal()
+        trayEnabledChanged = Signal()
+        trayAvailableChanged = Signal()
+        trayStatusTextChanged = Signal()
+        startWithWindowsChanged = Signal()
+        startWithWindowsStatusTextChanged = Signal()
+        startWithWindowsStatusIsErrorChanged = Signal()
+        closingBehaviorTextChanged = Signal()
 
         _TRIGGER_MODE_ORDER = tuple(key_mapping.VoiceTriggerMode)
         _DEVICE_ORDER = tuple(profile.device_id for profile in device_catalog.DEVICE_PROFILES)
@@ -758,12 +773,357 @@ def _load_qt_classes() -> dict:
             self._hotkeyCaptureResult.connect(self._on_hotkey_capture_result)
             self._bridge_handle: Optional[bridge_launcher.BridgeHandle] = None
 
+            self._tray_enabled: bool = bool(
+                self._config.get("tray_enabled", True)
+            )
+            self._tray_controller: Optional["tray_icon.TrayController"] = None
+            self._tray_available: bool = False
+            self._tray_status_text: str = ""
+            # start-with-Windows state is computed on demand by reading the
+            # Startup folder - it cannot be cached, because another process
+            # (the user, PowerShell, Windows itself) can drop / remove the
+            # shortcut at any time. ``_start_with_windows_status_text``
+            # is set the first time ``apply_runtime`` runs (see below)
+            # and again every time the user toggles the switch.
+            self._start_with_windows: bool = (
+                startup_shortcut.is_enabled()
+            )
+            self._start_with_windows_status_text: str = ""
+            self._start_with_windows_status_is_error: bool = False
+
             self._endpoint_options: List[str] = []
             self._selected_endpoint_index = -1
             self._refresh_endpoint_options()
             self._refresh_dji_mic_status()
             self._load_bindings_into_model()
             self._model.set_selected_button(self._selected_button_id)
+
+        # -- window event filter (close-to-tray) -----------------------------
+        def install_window_event_filter(self, window) -> None:
+            classes = _load_qt_classes()
+            QEvent = classes["QEvent"]
+            filter_cls = classes["_WindowEventFilter"]
+            self._window_event_filter = filter_cls(
+                QEvent.Type.Close, window, self
+            )
+            window.installEventFilter(self._window_event_filter)
+
+        def apply_runtime(self, window, qapp) -> None:
+            """Wire the controller to the live QApplication + window.
+
+            Called once from ``run_settings_window`` after the QML engine
+            has loaded the root window. Idempotent: a second call with
+            the same window is a no-op.
+
+            Responsibilities:
+
+            * Build the ``TrayController`` (if enabled) and connect its
+              ``show_window_requested`` / ``quit_requested`` signals.
+            * Install the window event filter so closing the window
+              hides it instead of quitting (when ``_tray_enabled``).
+            * Refresh the start-with-Windows status text now that we have
+              a Qt thread to safely hit the disk.
+            """
+            if getattr(self, "_runtime_applied", False):
+                return
+            self._runtime_window = window
+            self._runtime_qapp = qapp
+            # Order matters: tray controller must exist before the
+            # window event filter so the filter's
+            # ``_controller._tray_enabled`` check sees the live state.
+            self._apply_tray_to_runtime()
+            self.install_window_event_filter(window)
+            self._refresh_start_with_windows_status()
+            self._runtime_applied = True
+
+        def _apply_tray_to_runtime(self) -> None:
+            """Show or hide the system tray icon according to
+            ``_tray_enabled``. Also refreshes ``_tray_available`` /
+            ``_tray_status_text`` so the QML toggle can reflect what
+            actually happened on this host.
+            """
+            # Lazy-build the controller so PyInstaller frozen boot does
+            # not hit ``QMenu`` / ``QSystemTrayIcon`` (which require a
+            # live QGuiApplication) until ``show()`` is actually called.
+            if self._tray_enabled:
+                if self._tray_controller is None:
+                    self._tray_controller = tray_icon.TrayController(
+                        app_name="Remote Mic \u8bbe\u7f6e",
+                        is_shortcut_active_provider=startup_shortcut.is_enabled,
+                    )
+                    # Connect the menu signals to the controller
+                    # slots. The lambdas re-read attributes at click
+                    # time so they always see the latest values.
+                    self._tray_controller.show_window_requested.connect(
+                        self._on_tray_show_window
+                    )
+                    self._tray_controller.quit_requested.connect(
+                        self._on_tray_quit
+                    )
+                    # Sync the "Open Startup folder" menu item's
+                    # enabled state with reality on every change.
+                    self._tray_controller.set_shortcut_active(
+                        self._start_with_windows
+                    )
+                shown = self._tray_controller.show()
+                available = bool(shown)
+                self._tray_available = available
+                if available:
+                    self._tray_status_text = (
+                        "\u5df2\u542f\u7528\u7cfb\u7edf\u6258\u76d8\u56fe\u6807\uff0c"
+                        "\u5173\u95ed\u8bbe\u7f6e\u7a97\u53e3\u540e\u4ecd\u53ef\u4ece\u6258\u76d8\u6062\u590d\u3002"
+                    )
+                else:
+                    self._tray_status_text = (
+                        "\u672c\u673a\u672a\u68c0\u6d4b\u5230\u53ef\u7528\u7684\u7cfb\u7edf\u6258\u76d8\uff0c"
+                        "\u8bf7\u68c0\u67e5 Windows \u6258\u76d8\u670d\u52a1\u662f\u5426\u542f\u7528\u3002"
+                    )
+            else:
+                if self._tray_controller is not None:
+                    self._tray_controller.hide()
+                self._tray_available = False
+                self._tray_status_text = ""
+            self.trayEnabledChanged.emit()
+            self.trayAvailableChanged.emit()
+            self.trayStatusTextChanged.emit()
+
+        def _on_tray_show_window(self) -> None:
+            window = getattr(self, "_runtime_window", None)
+            if window is None:
+                return
+            try:
+                window.show()
+                window.raise_()
+                window.activateWindow()
+            except Exception:
+                logger.exception("tray: failed to show settings window")
+
+        def _on_tray_quit(self) -> None:
+            qapp = getattr(self, "_runtime_qapp", None)
+            if qapp is not None:
+                try:
+                    qapp.quit()
+                    return
+                except Exception:
+                    logger.exception("tray: qapp.quit failed")
+            # Fallback: walk sys.modules for a QCoreApplication instance.
+            try:
+                classes = _load_qt_classes()
+                QCoreApplication = classes["QCoreApplication"]
+                QCoreApplication.instance().quit()  # type: ignore[union-attr]
+            except Exception:
+                logger.exception("tray: fallback quit failed")
+
+        def _on_tray_open_startup_folder(self) -> None:
+            try:
+                from . import startup_shortcut as _ss
+                _ss_module = getattr(_ss, "open_startup_folder", None)
+                if _ss_module is not None:
+                    _ss_module()
+                else:
+                    # Fallback: just emit the signal/log; the menu
+                    # item is informational anyway.
+                    logger.info(
+                        "tray: open_startup_folder unavailable"
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception("tray: open startup folder failed")
+
+        def _on_window_minimised_to_tray(self) -> None:
+            if self._tray_controller is not None:
+                try:
+                    self._tray_controller.set_window_visible(False)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "tray: set_window_visible(False) failed"
+                    )
+
+        def _on_window_restored_from_tray(self) -> None:
+            if self._tray_controller is not None:
+                try:
+                    self._tray_controller.set_window_visible(True)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "tray: set_window_visible(True) failed"
+                    )
+
+        def _refresh_start_with_windows_status(self) -> None:
+            """Re-read ``startup_shortcut.is_enabled`` and update the
+            status text + is_error flag. Cheap; safe to call any time."""
+            new_state = bool(startup_shortcut.is_enabled())
+            changed = new_state != self._start_with_windows
+            self._start_with_windows = new_state
+            if new_state:
+                self._start_with_windows_status_text = (
+                    "\u5df2\u52a0\u5165\u5f00\u673a\u542f\u52a8\u3002\u4e0b\u6b21\u767b\u5f55 Windows "
+                    "\u4f1a\u81ea\u52a8\u6253\u5f00\u8bbe\u7f6e\u7a97\u53e3\u3002"
+                )
+                self._start_with_windows_status_is_error = False
+            else:
+                self._start_with_windows_status_text = (
+                    "\u672a\u52a0\u5165\u5f00\u673a\u542f\u52a8\u3002\u6253\u5f00\u540e\u4e0b\u6b21\u767b\u5f55\u4f1a\u81ea\u52a8\u52a0\u8f7d\u3002"
+                )
+                self._start_with_windows_status_is_error = False
+            if changed:
+                self.startWithWindowsChanged.emit()
+            self.startWithWindowsStatusTextChanged.emit()
+            self.startWithWindowsStatusIsErrorChanged.emit()
+            # Keep the tray's "Open Startup folder" menu item in sync
+            # with reality. No-op if the tray has not been
+            # constructed yet (apply_runtime hasn't run).
+            if self._tray_controller is not None:
+                try:
+                    self._tray_controller.set_shortcut_active(new_state)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "tray: set_shortcut_active sync failed"
+                    )
+
+        # -- properties (tray + start-with-Windows) ---------------------------
+
+        def _get_tray_enabled(self) -> bool:
+            return self._tray_enabled
+
+        def _set_tray_enabled(self, value: bool) -> None:
+            target = bool(value)
+            if target == self._tray_enabled:
+                return
+            self._tray_enabled = target
+            self._config["tray_enabled"] = target
+            self._save_config()
+            self._apply_tray_to_runtime()
+
+        def _get_tray_available(self) -> bool:
+            return self._tray_available
+
+        def _get_tray_status_text(self) -> str:
+            return self._tray_status_text
+
+        def _get_start_with_windows(self) -> bool:
+            return self._start_with_windows
+
+        def _set_start_with_windows(self, value: bool) -> None:
+            target = bool(value)
+            if target == self._start_with_windows and target == bool(
+                startup_shortcut.is_enabled()
+            ):
+                return
+            try:
+                if target:
+                    target_exe = self._resolve_autostart_target()
+                    if target_exe is None:
+                        self._start_with_windows_status_text = (
+                            "\u542f\u52a8\u9879\u5931\u8d25: \u672a\u80fd\u5b9a\u4f4d\u53ef\u6267\u884c\u6587\u4ef6\u3002"
+                        )
+                        self._start_with_windows_status_is_error = True
+                        self.startWithWindowsStatusTextChanged.emit()
+                        self.startWithWindowsStatusIsErrorChanged.emit()
+                        return
+                    result = startup_shortcut.enable(target_exe)
+                else:
+                    result = startup_shortcut.disable()
+            except Exception as exc:  # noqa: BLE001
+                self._start_with_windows_status_text = (
+                    f"\u542f\u52a8\u9879\u51fa\u9519: {exc}"
+                )
+                self._start_with_windows_status_is_error = True
+                self.startWithWindowsStatusTextChanged.emit()
+                self.startWithWindowsStatusIsErrorChanged.emit()
+                return
+            if result.outcome == startup_shortcut.StartupShortcutOutcome.FAILED:
+                self._start_with_windows_status_text = result.message
+                self._start_with_windows_status_is_error = True
+            else:
+                self._start_with_windows_status_text = result.message
+                self._start_with_windows_status_is_error = False
+            self._refresh_start_with_windows_status()
+
+        @staticmethod
+        def _resolve_autostart_target() -> Optional[Path]:
+            """Return the executable path that should be placed in the
+            Startup folder. ``None`` means we cannot autostart from
+            here (e.g. running tests or a misconfigured install).
+            """
+            # Frozen build: sys.executable is the .exe itself.
+            candidate = Path(getattr(sys, "executable", "") or "")
+            if candidate and candidate.suffix.lower() == ".exe":
+                return candidate.resolve()
+            # Source-mode fallback: prefer the installed .exe in dist/
+            # over the python interpreter, since the user probably
+            # wants to autostart the app, not the dev launcher.
+            project_root = Path(__file__).resolve().parent.parent.parent
+            for rel in (
+                "dist/RemoteMicRC003/RemoteMicRC003.exe",
+                "dist-new/RemoteMicRC003/RemoteMicRC003.exe",
+                "build/RemoteMicRC003/RemoteMicRC003.exe",
+            ):
+                probe = project_root / rel
+                if probe.exists():
+                    return probe.resolve()
+            return None
+
+        def _get_start_with_windows_status_text(self) -> str:
+            return self._start_with_windows_status_text
+
+        def _get_start_with_windows_status_is_error(self) -> bool:
+            return self._start_with_windows_status_is_error
+
+        def _get_closing_behavior_text(self) -> str:
+            if self._tray_enabled and self._tray_available:
+                return (
+                    "\u70b9\u51fb\u5173\u95ed\u6309\u94ae\u540e\u8bbe\u7f6e\u7a97\u53e3\u4f1a"
+                    "\u9690\u85cf\u5230\u7cfb\u7edf\u6258\u76d8\u3002"
+                    "\u8981\u5b8c\u5168\u9000\u51fa\u8bf7\u53f3\u952e\u6258\u76d8\u56fe\u6807 -> \u9000\u51fa\u3002"
+                )
+            return (
+                "\u70b9\u51fb\u5173\u95ed\u6309\u94ae\u4f1a\u9000\u51fa\u7a0b\u5e8f\u3002"
+                "\u542f\u7528\u4e0a\u9762\u7684\u6258\u76d8\u9009\u9879\u540e\uff0c"
+                "\u5173\u95ed\u4f1a\u9690\u85cf\u5230\u6258\u76d8\u3002"
+            )
+
+        @Slot()
+        def setTrayEnabled(self, value: bool) -> None:  # noqa: N802 (QML slot)
+            self._set_tray_enabled(value)
+
+        @Slot()
+        def setStartWithWindows(self, value: bool) -> None:  # noqa: N802
+            self._set_start_with_windows(value)
+
+        @Slot()
+        def refreshStartWithWindowsStatus(self) -> None:  # noqa: N802
+            """QML can call this on window show to re-read the on-disk
+            state in case the shortcut was removed out-of-band."""
+            self._refresh_start_with_windows_status()
+
+        def _save_config(self) -> None:
+            config.save_config(config.config_path(self._config_root), self._config)
+
+        trayEnabled = Property(
+            bool, _get_tray_enabled, _set_tray_enabled, notify=trayEnabledChanged
+        )
+        trayAvailable = Property(bool, _get_tray_available, notify=trayAvailableChanged)
+        trayStatusText = Property(
+            str, _get_tray_status_text, notify=trayStatusTextChanged
+        )
+        startWithWindows = Property(
+            bool,
+            _get_start_with_windows,
+            _set_start_with_windows,
+            notify=startWithWindowsChanged,
+        )
+        startWithWindowsStatusText = Property(
+            str,
+            _get_start_with_windows_status_text,
+            notify=startWithWindowsStatusTextChanged,
+        )
+        startWithWindowsStatusIsError = Property(
+            bool,
+            _get_start_with_windows_status_is_error,
+            notify=startWithWindowsStatusIsErrorChanged,
+        )
+        closingBehaviorText = Property(
+            str, _get_closing_behavior_text, notify=closingBehaviorTextChanged
+        )
 
         # -- internal helpers -------------------------------------------------
 
@@ -1769,6 +2129,38 @@ def _load_qt_classes() -> dict:
                     "重启电脑，然后点击「重新检测」确认两个虚拟音频端点已出现。"
                 )
 
+    class _WindowEventFilter(QObject):
+        """Intercepts QCloseEvent on the settings window to route it to
+        the tray instead of letting the window vanish. Constructed by
+        ``SettingsController.install_window_event_filter``.
+
+        Defined here (not at module scope) because PyInstaller's frozen
+        import evaluates module-level class statements BEFORE
+        ``_load_qt_classes`` runs - leaving a bare ``QObject`` reference
+        at module scope would raise ``NameError`` on every frozen boot,
+        the exact crash that prompted the previous workaround that
+        turned this into a plain Python class (which then broke
+        ``installEventFilter``, since that takes a real ``QObject``).
+        Defining it inside this lazy loader lets it inherit ``QObject``
+        cleanly without that hazard.
+        """
+
+        def __init__(self, close_event_type, window, controller) -> None:
+            super().__init__()
+            self._close_event_type = close_event_type
+            self._window = window
+            self._controller = controller
+
+        def eventFilter(self, watched, event) -> bool:  # noqa: N802
+            if (
+                watched is self._window
+                and event.type() == self._close_event_type
+            ):
+                if getattr(self._controller, "_tray_enabled", False):
+                    self._window.hide()
+                    return True
+            return False
+
     _qt_classes_cache = {
         "QGuiApplication": QGuiApplication,
         "QQmlApplicationEngine": QQmlApplicationEngine,
@@ -1779,6 +2171,18 @@ def _load_qt_classes() -> dict:
         "ButtonMappingModel": ButtonMappingModel,
         "SettingsController": SettingsController,
         "DiagnosticsController": DiagnosticsController,
+        # Tray / window-close wiring needs these at runtime
+        # (the SettingsController's install_window_event_filter and
+        # _WindowEventFilter pull them from this dict). They are imported
+        # above as module-level names inside this function body, so
+        # registering them here is the only safe way for the controller
+        # to reach them after _load_qt_classes() has returned.
+        "QEvent": QEvent,
+        "QObject": QObject,
+        "QCoreApplication": QCoreApplication,
+        "QCloseEvent": QCloseEvent,
+        "QApplication": QApplication,
+        "_WindowEventFilter": _WindowEventFilter,
     }
     return _qt_classes_cache
 
@@ -1802,6 +2206,7 @@ def run_settings_window() -> int:
     """
 
     classes = _load_qt_classes()
+    QApplication = classes["QApplication"]
     QGuiApplication = classes["QGuiApplication"]
     QQmlApplicationEngine = classes["QQmlApplicationEngine"]
     QQuickStyle = classes["QQuickStyle"]
@@ -1811,15 +2216,15 @@ def run_settings_window() -> int:
     SettingsController = classes["SettingsController"]
     DiagnosticsController = classes["DiagnosticsController"]
 
-    # Windows 11 Fluent look (In-scope item 7/DESIGN_VARIANCE): QQuickStyle
-    # must be set before the QGuiApplication/engine is constructed. Qt 6.7+
-    # ships "FluentWinUI3" specifically to emulate the Windows 11 Fluent
-    # design language for Qt Quick Controls; it renders (as a software
-    # fallback, not native WinUI3) on non-Windows hosts too, which is what
-    # this candidate's offscreen render/screenshot step below relies on.
-    QQuickStyle.setStyle("FluentWinUI3")
-
-    app = QGuiApplication.instance() or QGuiApplication(sys.argv)
+    # QApplication (not just QGuiApplication) is required because the
+    # tray uses QMenu/QSystemTrayIcon (QtWidgets). QGuiApplication lacks
+    # widget support and would print "QWidget: Cannot create a QWidget
+    # without QApplication" the first time we try to build the tray
+    # icon or its context menu in frozen builds. QApplication is a
+    # QGuiApplication subclass, so all existing call sites
+    # (``app.exec()``, ``app.quit()``, ``app.quit.connect(...)``) keep
+    # working unchanged.
+    app = QApplication.instance() or QApplication(sys.argv)
 
     model = ButtonMappingModel()
     controller = SettingsController(model)
@@ -1885,7 +2290,22 @@ def run_settings_window() -> int:
         main_qml = qml_dir / "main.qml"
         engine.load(QUrl.fromLocalFile(str(main_qml)))
         if not engine.rootObjects():
-            raise QtUnavailableError(f"无法加载 QML 设置界面：{main_qml} 未能成功加载。")
+            raise QtUnavailableError(
+                f"\u65e0\u6cd5\u52a0\u8f7d QML \u8bbe\u7f6e\u754c\u9762\uff1f{main_qml} \u672a\u80fd\u6210\u529f\u52a0\u8f7d\u3002"
+            )
+
+        # Wire the live QApplication + root window into the controller
+        # so the tray icon, system-tray menu, window-close-to-tray
+        # behaviour, and startup-shortcut status refresh all become
+        # effective. Called exactly once on first window load.
+        root_window = engine.rootObjects()[0]
+        try:
+            controller.apply_runtime(root_window, app)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "controller.apply_runtime failed - tray/startup "
+                "integration will be inactive this run"
+            )
 
         return app.exec()
     finally:

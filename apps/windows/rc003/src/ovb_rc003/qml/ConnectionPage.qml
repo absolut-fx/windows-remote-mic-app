@@ -115,8 +115,18 @@ Item {
                             id: stopBridgeButton
                             objectName: "stopBridgeButton"  // test hook
                             text: qsTr("停止桥接")
-                            enabled: SettingsController.bridgeRunning
-                            visible: SettingsController.bridgeRunning
+                            // Always enabled so the user can click it even before a
+                            // bridge has been launched. With no bridge, stopBridge()
+                            // returns NOT_RUNNING and describe_stop_result() surfaces
+                            // a "no bridge running" status message; with a live bridge
+                            // it terminates the subprocess. No-op in the former case
+                            // is by design.
+                            enabled: true
+                            // Always visible so the user can see the control even before
+                            // the bridge has been launched. Clicking while no bridge is
+                            // running is a safe no-op: stop_bridge() returns a
+                            // "No bridge was running" result via describe_stop_result().
+                            visible: true
                             onClicked: SettingsController.stopBridge()
                             KeyNavigation.tab: openLogButton
                         }

@@ -1268,7 +1268,14 @@ window = engine.rootObjects()[0]
 window.show()
 tab_bar = find_child(window, "tabBar")
 assert tab_bar is not None
-tab_bar.setProperty("currentIndex", 1)
+# Tab order is now 通用/连接/按键映射/权限/检查与修复 (GeneralPage was added
+# as index 0), so the 按键映射 tab lives at index 2. Probe by objectName
+# instead of positional index so the test survives future re-orders.
+mapping_tab_button = find_child(window, "mappingTabButton")
+if mapping_tab_button is not None:
+    mapping_tab_button.setProperty("checked", True)
+else:
+    tab_bar.setProperty("currentIndex", 2)
 for _ in range(10):
     window.grabWindow()
     app.processEvents()
