@@ -28,6 +28,8 @@ import asyncio
 import logging
 from typing import Awaitable, Callable, Optional
 
+from . import reconnect_policy
+
 ConnectFn = Callable[[], Awaitable[None]]
 CleanupFn = Callable[[], Awaitable[None]]
 SleepFn = Callable[[float], Awaitable[None]]
@@ -38,19 +40,34 @@ class ConnectionSupervisor:
         self,
         connect: ConnectFn,
         cleanup: CleanupFn,
-        retry_delay: float = 2.0,
-        max_retry_delay: Optional[float] = None,
+        retry_delay: float = 3.0,
+        max_retry_delay: Optional[float] = 60.0,
         logger: Optional[logging.Logger] = None,
         sleep: SleepFn = asyncio.sleep,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        policy: Optional[reconnect_policy.ReconnectPolicy] = None,
     ) -> None:
         self._connect = connect
         self._cleanup = cleanup
+        # ``retry_delay`` / ``max_retry_delay`` are kept as constructor args
+        # for backward compatibility with existing callers (app.py, tests),
+        # but the actual delay between attempts is owned by ``ReconnectPolicy``
+        # - the constructor args are now used only to build a default policy
+        # if the caller did not inject one. Callers that need a custom
+        # config (different base, jitter ratio, etc.) should pass ``policy``
+        # directly; the policy's clock is injectable for deterministic tests.
         self._retry_delay = max(0.0, retry_delay)
         if max_retry_delay is None:
             max_retry_delay = self._retry_delay
         self._max_retry_delay = max(self._retry_delay, max_retry_delay)
-        self._next_retry_delay = self._retry_delay
+        if policy is None:
+            policy = reconnect_policy.ReconnectPolicy(
+                config=reconnect_policy.ReconnectPolicyConfig(
+                    base_delay_seconds=self._retry_delay,
+                    maximum_delay_seconds=self._max_retry_delay,
+                )
+            )
+        self._policy = policy
         self._logger = logger
         self._sleep = sleep
         # Captured at construction time (must happen on the loop that will
@@ -65,6 +82,12 @@ class ConnectionSupervisor:
         self.attempt_count = 0
         self.cleanup_count = 0
         self.last_error: Optional[BaseException] = None
+
+    @property
+    def policy(self) -> reconnect_policy.ReconnectPolicy:
+        """The reconnect policy in use. Read-only view for tests; the
+        supervisor mutates the policy's internal counter directly."""
+        return self._policy
 
     def request_reconnect(self) -> None:
         """Call from any callback (a BLE disconnect notification, a protocol
@@ -103,14 +126,19 @@ class ConnectionSupervisor:
 
             if self._stopping:
                 break
-            delay = self._next_retry_delay
             if connected:
-                self._next_retry_delay = self._retry_delay
+                # Mac parity (HD838A BluetoothReconnectPolicy.reset): a
+                # truly Ready device collapses the consecutive-failure
+                # counter to zero so a freshly recovered link is not
+                # treated as "the 47th consecutive failure". The first
+                # delay after a successful connect is the policy's base.
+                self._policy.reset()
+                delay = self._retry_delay
             else:
-                self._next_retry_delay = min(
-                    self._max_retry_delay,
-                    max(self._retry_delay, self._next_retry_delay * 2),
-                )
+                # Mac parity (HD838A BluetoothReconnectPolicy.nextAutomaticDelay):
+                # each consecutive failure advances the exponential backoff
+                # by one exponent with +/- 10% jitter, capped at max_delay.
+                delay = self._policy.next_automatic_delay()
             await self._sleep(delay)
 
     async def stop(self) -> None:
