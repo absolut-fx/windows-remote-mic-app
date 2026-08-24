@@ -38,11 +38,15 @@ What this policy is NOT, by design:
   here and the toggle is intentionally absent.
 - It does not handle system-adapter state changes (poweredOff / poweredOn
   / resetting / unauthorized / unsupported). That is a separate Mac policy
-  (``BluetoothCentralRecoveryPolicy``) that requires a new WinRT
-  ``BluetoothAdapter`` event subscription that this repository does not
-  have today, and the project's hard boundary against operating real
-  devices in this repo means that work would land in a follow-up PR once
-  the new subscription is hardware-verified.
+  (``BluetoothCentralRecoveryPolicy``) that depends on CoreBluetooth
+  ``CBCentralManager`` delegate callbacks. On Windows it would need a new
+  ``Windows.Devices.Bluetooth.Adapter.BluetoothAdapter`` event
+  subscription which the repository does not currently have; tracked as a
+  separate future PR once hardware is available for validation.
+
+Module-level constants expose the Mac-parity defaults so tests and
+upstream callers can import them by name rather than duplicating the
+magic numbers.
 """
 
 from __future__ import annotations
@@ -51,18 +55,48 @@ from dataclasses import dataclass
 from typing import Callable
 
 
+# Mac parity: 3s base, 60s cap, +/- 10% jitter. Same numbers as
+# HD838A/remote-mic-app 1.8.15's BluetoothReconnectPolicy.
+DEFAULT_BASE_DELAY_SECONDS: float = 3.0
+DEFAULT_MAXIMUM_DELAY_SECONDS: float = 60.0
+DEFAULT_JITTER_RATIO: float = 0.1
+
+
 @dataclass(frozen=True)
 class ReconnectPolicyConfig:
-    """Tunables for ``ReconnectPolicy``. Defaults match Mac 1.8.25."""
+    """Immutable tuning knobs for a ``ReconnectPolicy``.
 
-    base_delay_seconds: float = 3.0
-    maximum_delay_seconds: float = 60.0
-    jitter_ratio: float = 0.1
+    Defaults match the Mac 1.8.15 parity numbers (``DEFAULT_BASE_DELAY_SECONDS``
+    / ``DEFAULT_MAXIMUM_DELAY_SECONDS`` / ``DEFAULT_JITTER_RATIO`` above).
+    Validation rejects pathological values at construction time so
+    production callers never accidentally configure ``base=0`` or
+    ``base > maximum``.
+    """
+
+    base_delay_seconds: float = DEFAULT_BASE_DELAY_SECONDS
+    maximum_delay_seconds: float = DEFAULT_MAXIMUM_DELAY_SECONDS
+    jitter_ratio: float = DEFAULT_JITTER_RATIO
     # Cap on the consecutive-failure exponent so even after many failures
     # we still plateau at ``maximum_delay_seconds`` (Mac uses 5 - 2^5 = 32,
     # so 32 * base = 96s would have exceeded the 60s cap; the cap is the
     # hard ceiling, the exponent just selects the nominal value).
     max_exponent: int = 5
+
+    def __post_init__(self) -> None:
+        if self.base_delay_seconds <= 0:
+            raise ValueError(
+                f"base_delay_seconds must be > 0, got {self.base_delay_seconds}"
+            )
+        if self.maximum_delay_seconds < self.base_delay_seconds:
+            raise ValueError(
+                "maximum_delay_seconds must be >= base_delay_seconds, "
+                f"got maximum={self.maximum_delay_seconds}, "
+                f"base={self.base_delay_seconds}"
+            )
+        if not 0.0 <= self.jitter_ratio < 0.5:
+            raise ValueError(
+                f"jitter_ratio must be in [0.0, 0.5), got {self.jitter_ratio}"
+            )
 
 
 class ReconnectPolicy:
@@ -109,7 +143,9 @@ class ReconnectPolicy:
         """
 
         self._consecutive_failure_count += 1
-        exponent = min(self._consecutive_failure_count - 1, self._config.max_exponent)
+        exponent = min(
+            self._consecutive_failure_count - 1, self._config.max_exponent
+        )
         nominal_delay = min(
             self._config.maximum_delay_seconds,
             self._config.base_delay_seconds * (2 ** exponent),
@@ -149,3 +185,12 @@ def _default_clock() -> int:
     import time
 
     return time.monotonic_ns()
+
+
+__all__ = [
+    "DEFAULT_BASE_DELAY_SECONDS",
+    "DEFAULT_JITTER_RATIO",
+    "DEFAULT_MAXIMUM_DELAY_SECONDS",
+    "ReconnectPolicy",
+    "ReconnectPolicyConfig",
+]
