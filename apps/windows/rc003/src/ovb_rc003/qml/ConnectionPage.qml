@@ -107,7 +107,17 @@ Item {
                             id: saveAndLaunchButton
                             text: qsTr("保存并启动桥接")
                             highlighted: true
+                            enabled: !SettingsController.bridgeRunning
                             onClicked: SettingsController.saveAndLaunch()
+                            KeyNavigation.tab: stopBridgeButton
+                        }
+                        Button {
+                            id: stopBridgeButton
+                            objectName: "stopBridgeButton"  // test hook
+                            text: qsTr("停止桥接")
+                            enabled: SettingsController.bridgeRunning
+                            visible: SettingsController.bridgeRunning
+                            onClicked: SettingsController.stopBridge()
                             KeyNavigation.tab: openLogButton
                         }
                         Button {
