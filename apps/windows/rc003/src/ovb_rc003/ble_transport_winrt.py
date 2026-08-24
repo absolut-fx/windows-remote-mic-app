@@ -96,6 +96,7 @@ from typing import Any, Callable, List, Optional
 from . import atvv_protocol as proto
 from . import atvv_session
 from . import identity
+from .connection_supervisor import TerminalConnectionError
 
 PcmCallback = Callable[[List[int]], None]
 ControlEventCallback = Callable[[object], None]
@@ -108,6 +109,43 @@ _WORKER_POLL_SECONDS = 0.2
 
 class WinRTUnavailableError(Exception):
     """Raised when the optional winrt Bluetooth packages are not installed."""
+
+
+# HRESULTs that mean "this adapter is permanently unusable for this process
+# and we should not retry" - see connection_supervisor.TerminalConnectionError
+# and the Mac port 0af93c3 shouldReleaseCentral decision. Anything else
+# (timeout, ATT failure, the device moved out of range, transient radio
+# contention) stays as a transient ConnectionError and the supervisor's
+# exponential-backoff retry loop continues to handle it.
+_TERMINAL_BLE_WIN32_HRESULT_CODES = frozenset(
+    {
+        0x80070005,  # E_ACCESSDENIED - user / policy revoked BLE permission
+        0x800704CD,  # ERROR_NOT_SUPPORTED - hardware has no BLE / wrong role
+    }
+)
+
+
+def _is_terminal_os_error(exc: BaseException) -> bool:
+    """True iff ``exc`` is a ``PermissionError`` or ``OSError`` whose
+    underlying Win32 code means the adapter is permanently unusable.
+
+    ``OSError`` on Windows is sometimes constructed with no ``winerror``
+    (pure-Python ``OSError(...)`` from inside the WinRT projection), in
+    which case ``winerror`` is ``None`` and we treat the error as transient
+    so the supervisor keeps retrying rather than locking up against an
+    unrelated filesystem/network error path that happened to surface as
+    ``OSError``.
+    """
+
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError):
+        code = getattr(exc, "winerror", None)
+        if code is None:
+            code = getattr(exc, "errno", None)
+        if code in _TERMINAL_BLE_WIN32_HRESULT_CODES:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -256,59 +294,82 @@ class RC003BleSession:
         self._generation += 1
         my_generation = self._generation
 
-        self._device = await winrt.bluetooth_le_device.from_id_async(candidate.handle.id)
-        if self._device is None:
-            raise ConnectionError("could not open the selected RC003 candidate")
-
-        self._connection_status_token = self._device.add_connection_status_changed(
-            self._handle_connection_status_changed
-        )
-
-        service_uuid = uuid.UUID(proto.VOICE_SERVICE_UUID)
-        # Windows caches the GATT table per device; a stale or incomplete
-        # cache can hide the ATVV characteristics that this app must read
-        # (observed as "ATVV characteristic not found"). Query the service
-        # and characteristics with UNCACHED so the device is re-read on the
-        # wire instead of trusting the local cache, matching the upstream
-        # remote-bridge-hub transport.
-        service_result = await self._device.get_gatt_services_for_uuid_with_cache_mode_async(
-            service_uuid, winrt.bluetooth_cache_mode.UNCACHED
-        )
-        if (
-            service_result.status != winrt.gatt_communication_status.SUCCESS
-            or not service_result.services
-        ):
-            raise ConnectionError("ATVV voice service not found on this device")
-        self._service = service_result.services[0]
-
-        self._tx_characteristic = await self._require_characteristic(
-            self._service, proto.VOICE_TX_UUID, winrt
-        )
-        self._audio_characteristic = await self._require_characteristic(
-            self._service, proto.VOICE_AUDIO_UUID, winrt
-        )
-        self._control_characteristic = await self._require_characteristic(
-            self._service, proto.VOICE_CONTROL_UUID, winrt
-        )
-
-        self._audio_token = self._audio_characteristic.add_value_changed(
-            self._handle_audio_notification
-        )
-        self._control_token = self._control_characteristic.add_value_changed(
-            self._handle_control_notification
-        )
-
-        for characteristic in (self._audio_characteristic, self._control_characteristic):
-            subscribe_status = await characteristic.write_client_characteristic_configuration_descriptor_async(  # noqa: E501
-                winrt.cccd_value.NOTIFY
+        # Adapter-level permanent failures (revoked permission, hardware
+        # that has no BLE, etc.) surface as PermissionError or as an
+        # OSError carrying one of _TERMINAL_BLE_WIN32_HRESULT_CODES - see
+        # _is_terminal_os_error. We re-raise those as
+        # TerminalConnectionError so connection_supervisor.run_forever
+        # exits the retry loop after one cleanup, instead of hammering the
+        # adapter through the full exponential-backoff window. Port of
+        # Mac 0af93c3's `shouldReleaseCentral` decision.
+        #
+        # Any other exception (including the existing ConnectionError
+        # raises below for "ATVV voice service not found", "characteristic
+        # not found", "subscribing to notifications failed", and any
+        # write-with-result failure) stays as a transient error: the
+        # supervisor's existing retry path handles it.
+        try:
+            self._device = await winrt.bluetooth_le_device.from_id_async(
+                candidate.handle.id
             )
-            if subscribe_status != winrt.gatt_communication_status.SUCCESS:
-                raise ConnectionError(
-                    f"subscribing to notifications failed: {subscribe_status}"
-                )
+            if self._device is None:
+                raise ConnectionError("could not open the selected RC003 candidate")
 
-        self._start_worker(my_generation)
-        await self._write_tx(proto.GET_CAPABILITIES_V10)
+            self._connection_status_token = self._device.add_connection_status_changed(
+                self._handle_connection_status_changed
+            )
+
+            service_uuid = uuid.UUID(proto.VOICE_SERVICE_UUID)
+            # Windows caches the GATT table per device; a stale or incomplete
+            # cache can hide the ATVV characteristics that this app must read
+            # (observed as "ATVV characteristic not found"). Query the service
+            # and characteristics with UNCACHED so the device is re-read on the
+            # wire instead of trusting the local cache, matching the upstream
+            # remote-bridge-hub transport.
+            service_result = await self._device.get_gatt_services_for_uuid_with_cache_mode_async(
+                service_uuid, winrt.bluetooth_cache_mode.UNCACHED
+            )
+            if (
+                service_result.status != winrt.gatt_communication_status.SUCCESS
+                or not service_result.services
+            ):
+                raise ConnectionError("ATVV voice service not found on this device")
+            self._service = service_result.services[0]
+
+            self._tx_characteristic = await self._require_characteristic(
+                self._service, proto.VOICE_TX_UUID, winrt
+            )
+            self._audio_characteristic = await self._require_characteristic(
+                self._service, proto.VOICE_AUDIO_UUID, winrt
+            )
+            self._control_characteristic = await self._require_characteristic(
+                self._service, proto.VOICE_CONTROL_UUID, winrt
+            )
+
+            self._audio_token = self._audio_characteristic.add_value_changed(
+                self._handle_audio_notification
+            )
+            self._control_token = self._control_characteristic.add_value_changed(
+                self._handle_control_notification
+            )
+
+            for characteristic in (self._audio_characteristic, self._control_characteristic):
+                subscribe_status = await characteristic.write_client_characteristic_configuration_descriptor_async(  # noqa: E501
+                    winrt.cccd_value.NOTIFY
+                )
+                if subscribe_status != winrt.gatt_communication_status.SUCCESS:
+                    raise ConnectionError(
+                        f"subscribing to notifications failed: {subscribe_status}"
+                    )
+
+            self._start_worker(my_generation)
+            await self._write_tx(proto.GET_CAPABILITIES_V10)
+        except (PermissionError, OSError) as exc:
+            if _is_terminal_os_error(exc):
+                raise TerminalConnectionError(
+                    f"BLE adapter is permanently unavailable: {exc!r}"
+                ) from exc
+            raise
 
     @staticmethod
     async def _require_characteristic(service, characteristic_uuid: str, winrt: WinRTModules):

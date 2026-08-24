@@ -35,7 +35,11 @@ import uuid
 from ovb_rc003 import atvv_protocol as proto
 from ovb_rc003 import atvv_session
 from ovb_rc003 import identity
-from ovb_rc003.ble_transport_winrt import RC003BleSession, discover_candidates
+from ovb_rc003.ble_transport_winrt import (
+    RC003BleSession,
+    _is_terminal_os_error,
+    discover_candidates,
+)
 
 from .fakes.fake_winrt import FakeWinRTEnvironment, gatt_service_instance_id
 
@@ -596,6 +600,53 @@ class CloseTests(unittest.TestCase):
         self.assertEqual(env.control_characteristic.cccd_history[-1], 0)
         self.assertEqual(len(env.audio_characteristic._handlers), 0)
         self.assertEqual(len(env.control_characteristic._handlers), 0)
+
+
+class TerminalOsErrorClassificationTests(unittest.TestCase):
+    """Port of Mac ``0af93c3``'s ``shouldReleaseCentral`` decision to the
+    WinRT-shaped call sites in ``ble_transport_winrt.connect()``.
+
+    On the Mac side, ``CBCentralManager.state`` is a real enum
+    (``.unauthorized`` / ``.unsupported`` / ``.poweredOff`` etc.), and the
+    bridge classifies the transition with a ``shouldReleaseCentral`` field.
+    The WinRT layer surfaces the same condition as either a
+    ``PermissionError`` (most common) or an ``OSError`` whose ``winerror``
+    is one of the documented BLE-adapter-permanent HRESULTs
+    (``E_ACCESSDENIED`` = 0x80070005, ``ERROR_NOT_SUPPORTED`` = 0x800704CD).
+
+    These tests pin down which errors get reclassified so that
+    ``connection_supervisor.run_forever`` can stop retrying instead of
+    spinning forever against an unusable adapter.
+    """
+
+    def test_permission_error_is_terminal(self):
+        self.assertTrue(_is_terminal_os_error(PermissionError("user denied")))
+
+    def test_oserror_with_e_accessdenied_is_terminal(self):
+        # 0x80070005 = E_ACCESSDENIED = 2147942405
+        self.assertTrue(_is_terminal_os_error(OSError(2147942405, "Access is denied.")))
+
+    def test_oserror_with_error_not_supported_is_terminal(self):
+        # 0x800704CD = ERROR_NOT_SUPPORTED = 2147943629
+        self.assertTrue(_is_terminal_os_error(OSError(2147943629, "Not supported")))
+
+    def test_oserror_with_generic_e_fail_is_not_terminal(self):
+        # 0x80004005 = E_FAIL = 2147500033 (transient - keep retrying)
+        self.assertFalse(_is_terminal_os_error(OSError(2147500033, "unspecified failure")))
+
+    def test_oserror_with_zero_winerror_is_not_terminal(self):
+        # errno-only OSError (no winerror) is transient
+        self.assertFalse(_is_terminal_os_error(OSError(0, "connection refused")))
+
+    def test_unrelated_exception_is_not_terminal(self):
+        self.assertFalse(_is_terminal_os_error(ValueError("noise")))
+
+    def test_already_terminal_connection_error_is_not_reclassified(self):
+        # TerminalConnectionError is the *result* of the classification, not
+        # a source - it must not be wrapped into itself.
+        from ovb_rc003.connection_supervisor import TerminalConnectionError
+
+        self.assertFalse(_is_terminal_os_error(TerminalConnectionError("already terminal")))
 
 
 if __name__ == "__main__":

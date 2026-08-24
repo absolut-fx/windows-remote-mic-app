@@ -35,6 +35,28 @@ CleanupFn = Callable[[], Awaitable[None]]
 SleepFn = Callable[[float], Awaitable[None]]
 
 
+class TerminalConnectionError(Exception):
+    """Raised by a ``connect`` callable to signal that the failure is
+    permanent for this process: the adapter is unusable, the user has
+    revoked permission, or the device is fundamentally incompatible.
+
+    Ported from Mac ``0af93c3``'s ``shouldReleaseCentral`` decision - on
+    that side, a ``.unauthorized`` or ``.unsupported`` event (or a
+    bridge-stopped state) tears down the retained ``CBCentralManager``
+    so the observer stops blocking future starts and stops the loop
+    from creating new managers against an unusable adapter. The
+    Windows side surfaces the same condition as a ``PermissionError``
+    or a specific HRESULT from ``from_id_async`` / the GATT calls;
+    raising this from ``connect`` lets ``run_forever`` end the loop
+    after a single cleanup instead of spinning through the
+    exponential-backoff window for the lifetime of the process.
+
+    Cleanup still runs before the loop exits - the existing ``finally``
+    block is the single source of truth, and the supervisor does not
+    need to know whether the underlying session got cleaned up.
+    """
+
+
 class ConnectionSupervisor:
     def __init__(
         self,
@@ -114,6 +136,20 @@ class ConnectionSupervisor:
                 await self._disconnect_event.wait()
             except asyncio.CancelledError:
                 raise
+            except TerminalConnectionError as exc:
+                # Permanent failure for this process - port of Mac 0af93c3's
+                # `shouldReleaseCentral` decision. Cleanup must still happen
+                # (existing finally handles it), but the loop must not
+                # schedule another retry: the adapter is unusable / the
+                # user revoked permission / the device is fundamentally
+                # incompatible, and hammering it through the exponential
+                # backoff window will just thrash.
+                self.last_error = exc
+                if self._logger is not None:
+                    self._logger.warning(
+                        "terminal connection failure, exiting loop: %s", exc
+                    )
+                self._stopping = True
             except Exception as exc:  # noqa: BLE001 - deliberately broad: any
                 # connect()/wait() failure must still fall through to cleanup
                 # and a retry, never propagate out of the supervisor.
