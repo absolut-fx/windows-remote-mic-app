@@ -21,6 +21,46 @@ class ConfigRootTests(unittest.TestCase):
             root = config.config_root()
         self.assertEqual(root, Path.home() / "RemoteMic" / "RC003")
 
+    def test_honors_CONFIG_ROOT_override_env_var_when_set(self):
+        with mock.patch.dict(
+            "os.environ",
+            {config._CONFIG_ROOT_OVERRIDE_ENV: r"C:\fake\dev-config-root"},
+            clear=False,
+        ):
+            root = config.config_root()
+        self.assertEqual(root, Path(r"C:\fake\dev-config-root"))
+
+    def test_CONFIG_ROOT_override_env_var_takes_precedence_over_LOCALAPPDATA(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                config._CONFIG_ROOT_OVERRIDE_ENV: r"C:\fake\dev-config-root",
+                "LOCALAPPDATA": r"C:\fake\real-localappdata",
+            },
+            clear=False,
+        ):
+            root = config.config_root()
+        self.assertEqual(root, Path(r"C:\fake\dev-config-root"))
+
+    def test_CONFIG_ROOT_override_env_var_treats_empty_value_as_unset(self):
+        with mock.patch.dict(
+            "os.environ",
+            {config._CONFIG_ROOT_OVERRIDE_ENV: "   "},
+            clear=False,
+        ):
+            with mock.patch.dict("os.environ", {"LOCALAPPDATA": r"C:\fake\real-localappdata"}):
+                root = config.config_root()
+        self.assertEqual(root, Path(r"C:\fake\real-localappdata") / "RemoteMic" / "RC003")
+
+    def test_CONFIG_ROOT_override_env_var_unset_uses_default(self):
+        with mock.patch.dict("os.environ", {"LOCALAPPDATA": r"C:\fake\real-localappdata"}):
+            with mock.patch.dict("os.environ", {}, clear=False):
+                import os
+
+                os.environ.pop(config._CONFIG_ROOT_OVERRIDE_ENV, None)
+                root = config.config_root()
+        self.assertEqual(root, Path(r"C:\fake\real-localappdata") / "RemoteMic" / "RC003")
+
 
 class DefaultConfigPrivacyTests(unittest.TestCase):
     def test_default_config_preserves_existing_users_on_rc003(self):
