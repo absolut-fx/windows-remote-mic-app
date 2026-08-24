@@ -377,6 +377,39 @@ def describe_launch_result(result: bridge_launcher.LaunchResult) -> str:
     )
 
 
+# Wording contract (mirrors ``LAUNCH_NOT_STARTED_TEXT`` above): a
+# STOPPED result is described as the process having exited, *not* as
+# "RC003 已断开". Whether the bridge actually released the BLE link, the
+# HID client, or the audio device is only observable from app.log. The
+# TIMED_OUT branch is the one that needs the user to investigate because
+# ``kill()`` on Windows is the same TerminateProcess as ``terminate()``,
+# so a process that survives both is in an unkillable Win32 call - the
+# settings window cannot fix that itself.
+STOP_NOT_RUNNING_TEXT = "未在运行（本次设置窗口打开后还没有启动过桥接，或者桥接已经退出）"
+
+
+def describe_stop_result(result: bridge_launcher.StopResult) -> str:
+    if result.outcome is bridge_launcher.StopOutcome.STOPPED:
+        code = (
+            f"（退出码 {result.exit_code}）"
+            if result.exit_code is not None
+            else ""
+        )
+        return (
+            f"已停止桥接进程{code}。这只说明进程本身已退出，不代表所有外部资源"
+            "已经释放——请用下方“打开日志目录”查看 app.log 确认 BLE/HID/音频"
+            "已实际释放。"
+        )
+    if result.outcome is bridge_launcher.StopOutcome.TIMED_OUT:
+        return (
+            "停止异常：桥接未能在宽限期内退出，已尝试强制终止。Windows 下 "
+            "kill() 与 terminate() 等价，如果进程仍然存活说明它卡在 Win32 "
+            "系统调用里——请用任务管理器结束 RemoteMicRC003，并用下方“打开"
+            "日志目录”查看 app.log 了解卡住的位置。"
+        )
+    return STOP_NOT_RUNNING_TEXT
+
+
 def describe_log_open_result(result: logging_setup.LogOpenResult) -> str:
     if result.outcome is logging_setup.LogOpenOutcome.OPENED:
         note = ""
