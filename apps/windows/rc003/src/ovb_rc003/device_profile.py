@@ -43,7 +43,14 @@ BUTTON_USAGE_IDS = {
     0x003E: "mic",
     0x00F1: "back",
     0x0028: "ok",
-    0x0035: "tv",
+    # TV reports HID usage 0x0031 ("Keyboard 1 and !"), not 0x0035 ("Grave
+    # Accent and Tilde"). Earlier forks inherited the upstream table's typo,
+    # which caused the DuplicateSuppressor to arm the wrong VK on every press
+    # - the real keystroke (digit "1" on US layouts) never matched and was
+    # never suppressed, leaking § on ISO layouts. Verified against rc003
+    # HID reports - see hd838a/remote-mic-app Bugs/2026-08-22-tv-native-keycode-
+    # leak.md for the parallel Mac-side discovery.
+    0x0031: "tv",
     0x004A: "home",
     0x004F: "right",
     0x0050: "left",
