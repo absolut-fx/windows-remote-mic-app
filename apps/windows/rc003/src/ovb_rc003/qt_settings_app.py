@@ -335,6 +335,11 @@ def _shutdown_qt_settings_app_at_exit() -> None:
     """The ONLY function this module registers via ``atexit`` (XRBM-031
     RETRY 2). Runs every shutdown step in one explicit, hard-coded order:
 
+    0. ``take_bridge_handle()`` - if a bridge is still running, stop it.
+       Runs FIRST so a bridge that finally exits as we tear down does not
+       emit diagnostic frames into a half-torn-down Qt runtime, and so
+       the bridge's HID pipe shutdown does not race with
+       ``_release_qt_classes_cache()``.
     1.-2. ``_shutdown_diagnostics_workers()`` - flags shutdown, then makes a
        bounded join attempt on every tracked worker thread (see that
        function's own docstring for why this is also called explicitly by
@@ -364,8 +369,59 @@ def _shutdown_qt_settings_app_at_exit() -> None:
     ``_shutdown_diagnostics_workers()``'s docstring for why.
     """
 
+    handle = take_bridge_handle()
+    if handle is not None:
+        bridge_launcher.stop_bridge(handle)
+
     _shutdown_diagnostics_workers()
     _release_qt_classes_cache()
+
+
+# Module-level bridge-handle cache.
+#
+# ``_shutdown_qt_settings_app_at_exit`` is module-level and runs from
+# ``atexit`` (or, defensively, from ``run_settings_window()``'s own
+# ``finally`` block) - it cannot reach a live ``SettingsController``
+# QObject, and PySide6 finalising the QObject graph at process exit makes
+# the relationship fragile. Instead the controller publishes the live
+# ``BridgeHandle`` here whenever it successfully starts a bridge; the
+# shutdown function consumes it. Mirrors the singleton-tracker pattern
+# already used by ``_qt_classes_cache`` above (same module, same scope).
+_bridge_handle_global: Optional[bridge_launcher.BridgeHandle] = None
+
+
+def register_bridge_handle(handle: bridge_launcher.BridgeHandle) -> None:
+    """Called by ``SettingsController.saveAndLaunch`` after a successful
+    ``launch_bridge()``. Replaces any prior handle (the previously running
+    bridge, if any, was either already stopped by ``stop_bridge()`` or
+    was never tracked - so the only safe action is to release the prior
+    handle to the caller before replacing)."""
+
+    global _bridge_handle_global
+    prior = _bridge_handle_global
+    _bridge_handle_global = handle
+    if prior is not None and prior is not handle:
+        bridge_launcher.stop_bridge(prior)
+
+
+def clear_bridge_handle() -> None:
+    """Called by ``SettingsController.stopBridge`` (after stopping the
+    bridge) and by ``_get_bridge_running`` when it observes the process
+    has died on its own. Idempotent."""
+
+    global _bridge_handle_global
+    _bridge_handle_global = None
+
+
+def take_bridge_handle() -> Optional[bridge_launcher.BridgeHandle]:
+    """Called by ``_shutdown_qt_settings_app_at_exit``. Atomically removes
+    AND returns the cached handle so the caller can stop exactly the
+    process it observes (no second copy to fight over)."""
+
+    global _bridge_handle_global
+    handle = _bridge_handle_global
+    _bridge_handle_global = None
+    return handle
 
 
 atexit.register(_shutdown_qt_settings_app_at_exit)
@@ -656,6 +712,7 @@ def _load_qt_classes() -> dict:
         hotkeyCaptured = Signal(str)
         hotkeyCaptureError = Signal(str)
         _hotkeyCaptureResult = Signal(str)
+        bridgeRunningChanged = Signal()
 
         _TRIGGER_MODE_ORDER = tuple(key_mapping.VoiceTriggerMode)
         _DEVICE_ORDER = tuple(profile.device_id for profile in device_catalog.DEVICE_PROFILES)
@@ -699,6 +756,7 @@ def _load_qt_classes() -> dict:
             self._rawKeyDetected.connect(self._on_raw_key_detected)
             self._hotkey_capture = None
             self._hotkeyCaptureResult.connect(self._on_hotkey_capture_result)
+            self._bridge_handle: Optional[bridge_launcher.BridgeHandle] = None
 
             self._endpoint_options: List[str] = []
             self._selected_endpoint_index = -1
@@ -983,6 +1041,18 @@ def _load_qt_classes() -> dict:
 
         launchStatusText = Property(str, _get_launch_status_text, notify=launchStatusTextChanged)
 
+        def _get_bridge_running(self) -> bool:
+            handle = self._bridge_handle
+            if handle is None:
+                return False
+            if not handle.process.is_alive():
+                self._bridge_handle = None
+                clear_bridge_handle()
+                return False
+            return True
+
+        bridgeRunning = Property(bool, _get_bridge_running, notify=bridgeRunningChanged)
+
         def _get_status_message(self) -> str:
             return self._status_message
 
@@ -1226,7 +1296,29 @@ def _load_qt_classes() -> dict:
                 return
             self._set_launch_status("正在启动…")
             result = bridge_launcher.launch_bridge()
+            if result.handle is not None:
+                self._bridge_handle = result.handle
+                register_bridge_handle(result.handle)
             self._set_launch_status(settings_ui.describe_launch_result(result))
+            self.bridgeRunningChanged.emit()
+
+        @Slot()
+        def stopBridge(self) -> None:
+            """Stop the bridge subprocess that ``saveAndLaunch`` started.
+
+            Settings window stays open - this is the Stop Bridge button,
+            not a close-window handler. ``run_settings_window()``'s own
+            ``finally`` clause and ``_shutdown_qt_settings_app_at_exit``
+            separately guarantee the bridge is stopped on window close;
+            this slot is the manual lever.
+            """
+
+            handle = self._bridge_handle
+            self._bridge_handle = None
+            clear_bridge_handle()
+            result = bridge_launcher.stop_bridge(handle)
+            self._set_launch_status(settings_ui.describe_stop_result(result))
+            self.bridgeRunningChanged.emit()
 
         @Slot()
         def restoreDefaults(self) -> None:
@@ -1799,6 +1891,7 @@ def run_settings_window() -> int:
     finally:
         controller.stopHotkeyCapture()
         controller.stopKeyDetection()
+        controller.stopBridge()
         # XRBM-035: called HERE, synchronously - whether app.exec()
         # returned normally, engine.load() raised, rootObjects() was empty,
         # or anything else in this block raised - and BEFORE this
