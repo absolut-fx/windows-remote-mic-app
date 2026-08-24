@@ -11,6 +11,7 @@ from pathlib import Path
 from ovb_rc003 import audio_output, bridge_launcher, hotkey, key_mapping, logging_setup, single_instance
 from ovb_rc003.settings_ui import (
     LAUNCH_NOT_STARTED_TEXT,
+    STOP_NOT_RUNNING_TEXT,
     SettingsValidationError,
     _VOICE_DISPLAY,
     _action_to_display,
@@ -21,6 +22,7 @@ from ovb_rc003.settings_ui import (
     default_display_state,
     describe_launch_result,
     describe_log_open_result,
+    describe_stop_result,
     voice_hotkey_for_trigger_mode,
 )
 
@@ -484,6 +486,105 @@ class DescribeLogOpenResultTests(unittest.TestCase):
         )
         text = describe_log_open_result(result)
         self.assertIn("no shell association available", text)
+
+
+class DescribeStopResultTests(unittest.TestCase):
+    """XRBM-029 follow-on: settings_ui's status text for each of the
+    three stable bridge-stop states (STOPPED, NOT_RUNNING, TIMED_OUT),
+    built directly on the same bridge_launcher.StopResult values
+    tests/test_bridge_launcher.py proves get produced.
+    """
+
+    def test_not_running_constant_includes_never_started_clause(self):
+        # Mirrors the LAUNCH_NOT_STARTED_TEXT contract: a fixed, non-empty
+        # status string the settings window shows before any stop attempt.
+        self.assertIn("未在运行", STOP_NOT_RUNNING_TEXT)
+
+    def test_not_running_outcome_uses_the_fixed_constant(self):
+        result = bridge_launcher.StopResult(
+            outcome=bridge_launcher.StopOutcome.NOT_RUNNING,
+        )
+        self.assertEqual(describe_stop_result(result), STOP_NOT_RUNNING_TEXT)
+
+    def test_not_running_outcome_with_a_known_exit_code_uses_the_fixed_constant(self):
+        # A process that already exited before stop_bridge was called: the
+        # text still must NOT repeat the exit code (that's only relevant for
+        # STOPPED), and must NOT escalate to the TIMED_OUT wording.
+        result = bridge_launcher.StopResult(
+            outcome=bridge_launcher.StopOutcome.NOT_RUNNING,
+            pid=999,
+            exit_code=0,
+        )
+        text = describe_stop_result(result)
+        self.assertEqual(text, STOP_NOT_RUNNING_TEXT)
+        self.assertNotIn("退出码", text)
+        self.assertNotIn("强制终止", text)
+
+    def test_stopped_outcome_mentions_the_exit_code_when_known(self):
+        result = bridge_launcher.StopResult(
+            outcome=bridge_launcher.StopOutcome.STOPPED,
+            pid=1234,
+            exit_code=0,
+        )
+        text = describe_stop_result(result)
+        self.assertIn("退出码 0", text)
+        self.assertNotIn("强制终止", text)
+
+    def test_stopped_outcome_with_no_exit_code_does_not_show_a_dash_or_none(self):
+        result = bridge_launcher.StopResult(
+            outcome=bridge_launcher.StopOutcome.STOPPED,
+            pid=1234,
+            exit_code=None,
+        )
+        text = describe_stop_result(result)
+        self.assertNotIn("None", text)
+        self.assertNotIn("退出码 ", text)  # space after to differentiate from "退出码 N"
+
+    def test_stopped_outcome_does_not_claim_external_resources_are_released(self):
+        # The text must not falsely reassure the user that BLE/HID/audio
+        # are released just because the process exited - the launcher's
+        # comment explicitly calls that out as something the user has to
+        # verify via app.log.
+        result = bridge_launcher.StopResult(
+            outcome=bridge_launcher.StopOutcome.STOPPED,
+            pid=1234,
+            exit_code=0,
+        )
+        text = describe_stop_result(result)
+        # The truthful message says "不代表...已经释放" ("does NOT mean they
+        # are released"). That phrasing necessarily contains the substring
+        # "已经释放" - the right contract is to assert the *negation*
+        # immediately precedes it.
+        self.assertIn("不代表", text)
+        self.assertIn("已经释放", text)
+        # It should also point the user at app.log for verification.
+        self.assertIn("app.log", text)
+
+    def test_escalated_stopped_still_shows_exit_code(self):
+        # When the process ignored terminate() and had to be kill()ed, the
+        # outcome is still STOPPED but escalated=True. The text must look
+        # the same as a non-escalated STOPPED - the escalation only
+        # matters for diagnostics, not user-visible wording.
+        result = bridge_launcher.StopResult(
+            outcome=bridge_launcher.StopOutcome.STOPPED,
+            pid=1234,
+            exit_code=137,
+            escalated=True,
+        )
+        text = describe_stop_result(result)
+        self.assertIn("退出码 137", text)
+        self.assertNotIn("强制终止", text)
+
+    def test_timed_out_outcome_mentions_force_termination_and_win32(self):
+        result = bridge_launcher.StopResult(
+            outcome=bridge_launcher.StopOutcome.TIMED_OUT,
+            pid=1234,
+            exit_code=None,
+            escalated=True,
+        )
+        text = describe_stop_result(result)
+        self.assertIn("强制终止", text)
+        self.assertIn("Win32", text)
 
 
 if __name__ == "__main__":
