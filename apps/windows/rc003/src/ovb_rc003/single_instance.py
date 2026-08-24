@@ -58,6 +58,7 @@ with the logic under test.
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 from ctypes import wintypes
 from typing import Callable, List, NamedTuple, Optional
@@ -66,7 +67,59 @@ from typing import Callable, List, NamedTuple, Optional
 # Windows logon session, matching the task's "per-session/local name"
 # requirement - a second bridge started by a different logged-in user (or
 # in a different session) is not this guard's concern.
-_MUTEX_NAME = r"Local\RemoteMicRC003_BridgeInstance"
+_MUTEX_BASE_NAME = r"Local\RemoteMicRC003_BridgeInstance"
+
+# Env-var hook for side-by-side development builds (audit/batch1): when
+# REMOTEMIC_RC003_INSTANCE_SUFFIX is set to a non-empty, identifier-safe
+# string, the default mutex name gets that string appended (e.g. "_Dev")
+# so a source-tree ``python -m ovb_rc003 --bridge`` does not collide with
+# the installed ``RemoteMicRC003.exe``'s bridge. Production launches
+# leave the variable unset, so the shipped build keeps claiming exactly
+# the same named mutex it always has. Honored by ``_default_mutex_name``
+# only - ``BridgeInstanceGuard.__init__``'s ``name`` parameter continues
+# to default through that helper, so any caller that already passes an
+# explicit ``name=`` (e.g. tests via ``BridgeInstanceGuard(name="...")``)
+# is unaffected.
+_MUTEX_SUFFIX_ENV = "REMOTEMIC_RC003_INSTANCE_SUFFIX"
+# Mutex names are case-insensitive on Windows but do treat the entire
+# string as the identifier, so reject characters that could ever affect
+# how the OS compares them across two processes - keep the dev suffix to
+# the conservative subset that is obviously a programmer-supplied tag.
+_ALLOWED_SUFFIX_CHARS = frozenset("_-.")
+
+
+def _default_mutex_name() -> str:
+    """Return the bridge mutex name to use for this process.
+
+    Honors ``REMOTEMIC_RC003_INSTANCE_SUFFIX`` for side-by-side
+    development builds (see ``_MUTEX_SUFFIX_ENV``): the shipped executable
+    never sets it, so production runs always take ``_MUTEX_BASE_NAME``;
+    a source-tree dev launch sets it (e.g. to ``_Dev``), which is
+    appended verbatim so the dev build claims a different named mutex
+    than the installed app and the two never trip the
+    ``DuplicateInstanceError`` fail-closed branch.
+
+    An unset, empty, or whitespace-only suffix falls back to the base
+    name (matching how ``config_root()`` already treats an unset
+    ``LOCALAPPDATA``). A suffix containing anything outside the
+    identifier-safe subset (``_``, ``-``, ``.`` plus alphanumerics) is
+    rejected and falls back to the base name, so a misconfigured dev
+    environment can never inject a suffix that breaks mutex lookup on
+    Windows (which has its own rules around backslash, etc.). The
+    hard-coded ``_MUTEX_BASE_NAME`` itself is NEVER validated through
+    here - that constant has been the only mutex this app has ever used
+    and changing it would itself be a behavior change.
+    """
+
+    suffix = os.environ.get(_MUTEX_SUFFIX_ENV)
+    if not suffix:
+        return _MUTEX_BASE_NAME
+    suffix = suffix.strip()
+    if not suffix:
+        return _MUTEX_BASE_NAME
+    if any(ch not in _ALLOWED_SUFFIX_CHARS and not ch.isalnum() for ch in suffix):
+        return _MUTEX_BASE_NAME
+    return _MUTEX_BASE_NAME + suffix
 
 # https://learn.microsoft.com/windows/win32/debug/system-error-codes--0-499-
 _ERROR_ALREADY_EXISTS = 183
@@ -221,11 +274,20 @@ class BridgeInstanceGuard:
     def __init__(
         self,
         *,
-        name: str = _MUTEX_NAME,
+        name: str = None,
         _create_mutex: CreateMutexFn = _real_create_mutex,
         _release_mutex: ReleaseMutexFn = _real_release_mutex,
         _close_handle: CloseHandleFn = _real_close_handle,
     ) -> None:
+        # Default is resolved lazily so that ``BridgeInstanceGuard()``
+        # with no ``name`` argument picks up the
+        # ``REMOTEMIC_RC003_INSTANCE_SUFFIX`` env var at the moment the
+        # guard is constructed (not at module-import time). Tests that
+        # want to freeze a specific name continue to pass ``name=...``
+        # explicitly; ``_default_mutex_name()`` only runs in the
+        # no-explicit-name path.
+        if name is None:
+            name = _default_mutex_name()
         self._name = name
         self._create_mutex = _create_mutex
         self._release_mutex = _release_mutex

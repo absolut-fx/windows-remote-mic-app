@@ -33,6 +33,22 @@ KEY_BINDINGS_FILENAME = "key_bindings.json"
 
 SCHEMA_VERSION = 1
 
+# Env-var hook for side-by-side development builds (audit/batch1):
+# setting REMOTEMIC_RC003_CONFIG_ROOT to an absolute path forces
+# ``config_root()`` to use that directory verbatim, instead of the default
+# ``%LOCALAPPDATA%\RemoteMic\RC003`` (or ``~/RemoteMic/RC003`` fallback).
+# Production launches leave the variable unset, so the shipped
+# RemoteMicRC003.exe keeps reading/writing exactly the path it always has -
+# the override exists purely so a developer can run a source-tree build
+# (``python -m ovb_rc003``) without it clobbering, or being clobbered by,
+# the installed app's config files. Honored by ``config_root()`` only;
+# ``save_config``/``load_config`` and their callers go through that helper,
+# so a single chokepoint covers both ``config.json`` and
+# ``key_bindings.json``. An unset, empty, or whitespace-only value falls
+# back to the default behavior - matching how ``LOCALAPPDATA`` itself is
+# treated immediately below.
+_CONFIG_ROOT_OVERRIDE_ENV = "REMOTEMIC_RC003_CONFIG_ROOT"
+
 # Any config key matching one of these names is refused at save time,
 # regardless of which file it would land in.
 FORBIDDEN_KEYS = frozenset(
@@ -53,7 +69,36 @@ class ConfigPrivacyError(Exception):
     """Raised when code attempts to persist a forbidden identity field."""
 
 
+def _config_root_override() -> Optional[Path]:
+    """Return the developer-only config-root override, or ``None``.
+
+    Honors ``REMOTEMIC_RC003_CONFIG_ROOT`` for side-by-side development
+    builds (see ``_CONFIG_ROOT_OVERRIDE_ENV``): the shipped executable never
+    sets it, so production runs take the standard ``%LOCALAPPDATA%`` (or
+    home-directory) path. A source-tree dev launch sets it to an isolated
+    directory under ``%LOCALAPPDATA%\RemoteMic\RC003-Dev`` (or similar)
+    so its ``config.json``/``key_bindings.json`` never collide with the
+    installed app's. Empty / whitespace-only values are treated as unset -
+    matching how ``config_root()`` already treats an unset ``LOCALAPPDATA``.
+
+    The returned path is NOT created here; callers that need it to exist
+    (``save_config``/``save_key_bindings`` via ``_save_json_atomic``)
+    create it themselves with ``parents=True``.
+    """
+
+    raw = os.environ.get(_CONFIG_ROOT_OVERRIDE_ENV)
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    return Path(stripped)
+
+
 def config_root() -> Path:
+    override = _config_root_override()
+    if override is not None:
+        return override
     base = os.environ.get("LOCALAPPDATA")
     if not base:
         base = str(Path.home())
