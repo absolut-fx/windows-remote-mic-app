@@ -7,7 +7,10 @@ import asyncio
 import threading
 import unittest
 
-from ovb_rc003.connection_supervisor import ConnectionSupervisor
+from ovb_rc003.connection_supervisor import (
+    ConnectionSupervisor,
+    TerminalConnectionError,
+)
 
 
 def _run(coro):
@@ -327,6 +330,104 @@ class RetryBackoffTests(unittest.TestCase):
 
         _run(scenario())
         self.assertEqual(delays, [5.0, 10.0, 20.0, 5.0])
+
+
+class TerminalErrorTests(unittest.TestCase):
+    """Port of Mac ``0af93c3``'s ``shouldReleaseCentral`` decision: a permanent
+    ``connect`` failure breaks the retry loop after a single cleanup instead
+    of spinning through the backoff window for the lifetime of the process.
+    On the Windows side this is signalled by ``TerminalConnectionError`` -
+    raised by the transport when ``from_id_async`` returns
+    ``E_ACCESSDENIED`` / ``ERROR_NOT_SUPPORTED`` or a ``PermissionError``
+    bubbles up out of the WinRT layer.
+    """
+
+    def test_terminal_connect_error_exits_loop_after_one_cleanup(self):
+        recorder = _Recorder()
+
+        async def connect():
+            recorder.record("connect")
+            raise TerminalConnectionError(
+                "adapter permission denied - port of Mac 0af93c3 .unauthorized"
+            )
+
+        async def cleanup():
+            recorder.record("cleanup")
+
+        async def fake_sleep(_seconds):
+            recorder.record("sleep")
+            self.fail(
+                "fake_sleep should never be called on a terminal error: "
+                "the loop must exit before scheduling the next retry"
+            )
+
+        async def scenario():
+            supervisor = ConnectionSupervisor(connect, cleanup, sleep=fake_sleep)
+            await supervisor.run_forever()  # returns cleanly on terminal error
+
+        _run(scenario())
+        # Exactly one connect + one cleanup + zero sleeps. No retry window.
+        self.assertEqual(recorder.events, ["connect", "cleanup"])
+
+    def test_transient_connect_error_still_retries_after_terminal_classification(self):
+        """Regression: only ``TerminalConnectionError`` short-circuits the
+        loop. A plain ``RuntimeError`` (or any non-terminal exception) must
+        still flow through the backoff path.
+        """
+        recorder = _Recorder()
+
+        async def connect():
+            recorder.record("connect")
+            raise RuntimeError("transient GATT timeout")
+
+        async def cleanup():
+            recorder.record("cleanup")
+
+        async def fake_sleep(_seconds):
+            recorder.record("sleep")
+            if len(recorder.events) >= 5:
+                raise asyncio.CancelledError()  # bail after a few retries
+
+        async def scenario():
+            supervisor = ConnectionSupervisor(
+                connect,
+                cleanup,
+                retry_delay=5.0,
+                max_retry_delay=20.0,
+                sleep=fake_sleep,
+            )
+            with self.assertRaises(asyncio.CancelledError):
+                await supervisor.run_forever()
+
+        _run(scenario())
+        # We expect at least two connect attempts separated by sleeps and
+        # cleanups. The exact count depends on how the fake_sleep cancels
+        # itself, but the structure must be connect/cleanup/sleep repeated.
+        events = recorder.events
+        self.assertGreater(events.count("connect"), 1)
+        self.assertGreater(events.count("sleep"), 1)
+        self.assertEqual(events.count("connect"), events.count("cleanup"))
+
+    def test_terminal_error_is_recorded_for_diagnostics(self):
+        boom = TerminalConnectionError("bluetooth adapter unsupported")
+
+        async def connect():
+            raise boom
+
+        async def cleanup():
+            pass
+
+        async def fake_sleep(_seconds):
+            self.fail("no sleep on terminal error")
+
+        async def scenario():
+            supervisor = ConnectionSupervisor(connect, cleanup, sleep=fake_sleep)
+            await supervisor.run_forever()
+            return supervisor
+
+        supervisor = _run(scenario())
+        # Parity with StopBehaviorTests.test_last_error_is_recorded_for_diagnostics
+        self.assertIs(supervisor.last_error, boom)
 
 
 if __name__ == "__main__":
