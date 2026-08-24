@@ -2224,7 +2224,33 @@ def run_settings_window() -> int:
     # QGuiApplication subclass, so all existing call sites
     # (``app.exec()``, ``app.quit()``, ``app.quit.connect(...)``) keep
     # working unchanged.
+    #
+    # Dark-mode strategy (user-stated preference; do NOT revert without
+    # asking): two style calls, two scopes.
+    #   1. QQuickStyle.setStyle("FluentWinUI3")  -- Qt Quick Controls /
+    #      QML side (the settings window itself). Must be set BEFORE the
+    #      QML engine loads; calling it pre-QApplication() is the
+    #      Qt 6.7+-blessed position. FluentWinUI3 honours the Windows
+    #      11 system theme via the OS registry, so when Win11 is in
+    #      dark mode the settings window renders dark too.
+    #   2. app.setStyle("Fusion")  -- QtWidgets side (the tray icon's
+    #      QMenu / context menu). Fusion is the only cross-platform
+    #      style that respects QPalette dark colours reliably; on
+    #      Windows the default "windowsvista"/"windowsui" style often
+    #      ignores the palette and stays light.
+    # The previous assistant dropped these two lines in commit a426942
+    # ("Fusion dark-mode reverted") because a bare setStyle("Fusion")
+    # did not darken QML by itself -- correct, because Fusion is a
+    # QtWidgets style and has no effect on QQuickControls. Both calls
+    # are required together. See docs/dark-mode-strategy.md.
+    QQuickStyle.setStyle("FluentWinUI3")
     app = QApplication.instance() or QApplication(sys.argv)
+    # Only call setStyle on the full QApplication -- module-level import of
+    # qt_settings_app in offscreen test harness yields a bare QGuiApplication
+    # via ``QGuiApplication.instance()``, which has no ``setStyle``. Without
+    # this guard, importing the module in tests raises AttributeError.
+    if isinstance(app, QApplication) and type(app) is QApplication:
+        app.setStyle("Fusion")
 
     model = ButtonMappingModel()
     controller = SettingsController(model)
