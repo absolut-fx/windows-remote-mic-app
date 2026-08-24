@@ -34,6 +34,16 @@ DEVICE_PROFILES_DIR = REPO_ROOT / "device-profiles"
 # offline on the end-user machine.
 VB_CABLE_BUNDLE_ZIP = RC003_ROOT / "build" / "third_party" / "VBCABLE_Driver_Pack45.zip"
 FRIDA_ASSET_DIR = SRC_ROOT / "ovb_rc003" / "frida_assets"
+# Tray-icon SVG lives under <project>/assets/icons/app-tray.svg.
+# Bundled unmodified under "ovb_rc003_assets" inside the COLLECT
+# output, matching tray_icon.py's ``_assets_directory()``, which looks
+# under ``sys._MEIPASS / "ovb_rc003_assets"`` in a frozen build. The
+# loader falls back to a programmatic QPixmap glyph if the file is
+# absent (e.g. a bare ``pyinstaller`` invocation without the assets
+# tree), so a missing assets/ at spec time is not a build error -
+# mirroring the defensive pattern used for the photo/qml/vb_cable
+# entries below.
+ASSETS_DIR = RC003_ROOT / "assets"
 
 datas = []
 if REMOTE_PHOTO.is_file():
@@ -77,12 +87,22 @@ for frida_asset in FRIDA_ASSET_DIR.glob("*.xz"):
     # Runtime verifies the archive again before extracting it into the locked
     # ProgramData directory. This remains optional for source-only builds.
     datas.append((str(frida_asset), "ovb_rc003/frida_assets"))
+if ASSETS_DIR.is_dir():
+    # See ASSETS_DIR comment above for the sys._MEIPASS path layout
+    # this matches. Whole-directory copy preserves any future siblings
+    # (e.g. installer/launcher PNGs) without further spec edits.
+    datas.append((str(ASSETS_DIR), "ovb_rc003_assets"))
 
 hiddenimports = [
     "ovb_rc003.app",
     "ovb_rc003.device_catalog",  # XRBM-036: multi-device settings/runtime gate
     "ovb_rc003.settings_ui",
     "ovb_rc003.qt_settings_app",  # XRBM-030
+    "ovb_rc003.startup_shortcut",  # tray/autostart feature; lazily
+    # imported inside SettingsController + _open_startup_folder_in_explorer,
+    # so PyInstaller's static analysis misses it without an explicit entry.
+    "ovb_rc003.tray_icon",  # tray/autostart feature; lazily imported
+    # inside install_window_event_filter(), same reason.
     "ovb_rc003.windows_diagnostics",  # XRBM-031
     "ovb_rc003.vb_cable_bundle",  # XRBM-031
     "ovb_rc003.ble_transport_winrt",
