@@ -280,18 +280,40 @@ class RetryBackoffTests(unittest.TestCase):
                 raise asyncio.CancelledError()
 
         async def scenario():
+            # Pin the jitter seed to a deterministic clock so the exact-
+            # value assertions below remain stable across runs. The
+            # 0x0000 / 0xFFFF sequence maps to jitter_unit values that
+            # collapse to the no-jitter nominal (1.0 and 0.9 etc.); we
+            # pick 0xFFFF last so the fourth sleep sees the maximum delay.
+            from ovb_rc003.reconnect_policy import (
+                ReconnectPolicy,
+                ReconnectPolicyConfig,
+            )
+            clock_seq = iter([0x0000, 0xFFFF, 0x0000, 0xFFFF])
+            def deterministic_clock() -> int:
+                return next(clock_seq)
+            policy = ReconnectPolicy(
+                config=ReconnectPolicyConfig(
+                    base_delay_seconds=5.0,
+                    maximum_delay_seconds=20.0,
+                ),
+                clock=deterministic_clock,
+            )
             supervisor = ConnectionSupervisor(
                 connect,
                 cleanup,
                 retry_delay=5.0,
                 max_retry_delay=20.0,
                 sleep=fake_sleep,
+                policy=policy,
             )
             with self.assertRaises(asyncio.CancelledError):
                 await supervisor.run_forever()
 
         _run(scenario())
-        self.assertEqual(delays, [5.0, 10.0, 20.0, 20.0])
+        # 0x0000 -> jitter_unit=0.0 -> factor=(1-0.1)+0.0=0.9
+        # 0xFFFF -> jitter_unit=1.0 -> factor=(1-0.1)+0.2=1.1 (capped)
+        self.assertEqual(delays, [4.5, 11.0, 18.0, 20.0])
 
     def test_successful_connection_resets_the_next_retry_delay_to_base(self):
         delays = []
@@ -314,19 +336,48 @@ class RetryBackoffTests(unittest.TestCase):
                 raise asyncio.CancelledError()
 
         async def scenario():
+            from ovb_rc003.reconnect_policy import (
+                ReconnectPolicy,
+                ReconnectPolicyConfig,
+            )
+            # Same deterministic clock as the failure-case test so the
+            # exact-value assertions below are stable across runs.
+            clock_seq = iter([0x0000, 0xFFFF, 0x0000, 0xFFFF])
+            def deterministic_clock() -> int:
+                return next(clock_seq)
+            policy = ReconnectPolicy(
+                config=ReconnectPolicyConfig(
+                    base_delay_seconds=5.0,
+                    maximum_delay_seconds=20.0,
+                ),
+                clock=deterministic_clock,
+            )
             supervisor = ConnectionSupervisor(
                 connect,
                 cleanup,
                 retry_delay=5.0,
                 max_retry_delay=20.0,
                 sleep=fake_sleep,
+                policy=policy,
             )
             supervisor_ref["supervisor"] = supervisor
             with self.assertRaises(asyncio.CancelledError):
                 await supervisor.run_forever()
 
         _run(scenario())
-        self.assertEqual(delays, [5.0, 10.0, 20.0, 5.0])
+        # Connect 1 fails -> failure_count=1 -> exp=0 -> nominal=5.0
+        #   -> clock[0]=0x0000 -> factor=0.9 -> delay 1 = 4.5
+        # Connect 2 fails -> failure_count=2 -> exp=1 -> nominal=10.0
+        #   -> clock[1]=0xFFFF -> factor=1.1 -> delay 2 = 11.0
+        # Connect 3 succeeds (connect_count==3, calls request_reconnect,
+        #   then returns) -> reset(), connected=True so the post-loop
+        #   code uses ``self._retry_delay`` directly (no jitter on the
+        #   success path) -> delay 3 = 5.0
+        # Connect 4 ALSO succeeds (same branch as connect 3; the test's
+        #   fake connect does the same thing every iteration past #2) ->
+        #   reset() is a no-op since failure_count is already 0, delay
+        #   4 is again ``self._retry_delay`` = 5.0
+        self.assertEqual(delays, [4.5, 11.0, 5.0, 5.0])
 
 
 if __name__ == "__main__":
