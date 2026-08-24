@@ -13,6 +13,7 @@ import inspect
 import sys
 import unittest
 from ctypes import wintypes
+from unittest import mock
 
 from ovb_rc003 import single_instance
 
@@ -483,6 +484,129 @@ class MutexCtypesPrototypeTests(unittest.TestCase):
         self.assertIn("MessageBoxW.restype", source)
         for token in ("wintypes.HWND", "wintypes.LPCWSTR", "wintypes.UINT"):
             self.assertIn(token, source)
+
+
+class DefaultMutexNameTests(unittest.TestCase):
+    """Covers the ``REMOTEMIC_RC003_INSTANCE_SUFFIX`` env-var hook used by
+    side-by-side development builds (audit/batch1): when the variable is
+    unset/empty, the default mutex name is the production constant; when
+    it is set to a non-empty identifier-safe string, that string is
+    appended to the base name; and when it contains anything outside the
+    conservative ``_ - .`` + alphanumerics subset, the helper falls back
+    to the base name rather than risk a malformed mutex identifier.
+    """
+
+    def test_unset_returns_base_name(self):
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os
+
+            os.environ.pop(single_instance._MUTEX_SUFFIX_ENV, None)
+            self.assertEqual(
+                single_instance._default_mutex_name(),
+                single_instance._MUTEX_BASE_NAME,
+            )
+
+    def test_empty_value_returns_base_name(self):
+        with mock.patch.dict(
+            "os.environ", {single_instance._MUTEX_SUFFIX_ENV: ""}, clear=False
+        ):
+            self.assertEqual(
+                single_instance._default_mutex_name(),
+                single_instance._MUTEX_BASE_NAME,
+            )
+
+    def test_whitespace_only_value_returns_base_name(self):
+        with mock.patch.dict(
+            "os.environ", {single_instance._MUTEX_SUFFIX_ENV: "   "}, clear=False
+        ):
+            self.assertEqual(
+                single_instance._default_mutex_name(),
+                single_instance._MUTEX_BASE_NAME,
+            )
+
+    def test_dev_suffix_appends_to_base_name(self):
+        with mock.patch.dict(
+            "os.environ",
+            {single_instance._MUTEX_SUFFIX_ENV: "_Dev"},
+            clear=False,
+        ):
+            self.assertEqual(
+                single_instance._default_mutex_name(),
+                single_instance._MUTEX_BASE_NAME + "_Dev",
+            )
+
+    def test_alphanumeric_dev_suffix_is_honored(self):
+        with mock.patch.dict(
+            "os.environ",
+            {single_instance._MUTEX_SUFFIX_ENV: "Dev01"},
+            clear=False,
+        ):
+            self.assertEqual(
+                single_instance._default_mutex_name(),
+                single_instance._MUTEX_BASE_NAME + "Dev01",
+            )
+
+    def test_dangerous_suffix_characters_fall_back_to_base_name(self):
+        # Backslash and quotes must never appear in a Win32 named-mutex
+        # identifier if we want the OS lookup to behave predictably;
+        # the helper rejects them rather than risk a malformed name.
+        for bad in (r"a\b", 'c"d', "e\nf", "g:h"):
+            with mock.patch.dict(
+                "os.environ",
+                {single_instance._MUTEX_SUFFIX_ENV: bad},
+                clear=False,
+            ):
+                self.assertEqual(
+                    single_instance._default_mutex_name(),
+                    single_instance._MUTEX_BASE_NAME,
+                    msg=f"bad suffix {bad!r} should have fallen back to base name",
+                )
+
+
+class BridgeInstanceGuardUsesDefaultMutexNameTests(unittest.TestCase):
+    """End-to-end: a ``BridgeInstanceGuard()`` constructed with no
+    ``name=`` argument picks up ``REMOTEMIC_RC003_INSTANCE_SUFFIX`` at
+    construction time and threads the suffixed name into
+    ``CreateMutexW`` - the contract this audit/batch1 patch relies on.
+    """
+
+    def test_default_name_is_suffixed_when_env_var_set(self):
+        registry = _FakeMutexRegistry()
+        with mock.patch.dict(
+            "os.environ",
+            {single_instance._MUTEX_SUFFIX_ENV: "_Dev"},
+            clear=False,
+        ):
+            with single_instance.BridgeInstanceGuard(
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            ):
+                pass
+        self.assertEqual(len(registry.create_calls), 1)
+        self.assertEqual(
+            registry.create_calls[0], single_instance._MUTEX_BASE_NAME + "_Dev"
+        )
+
+    def test_explicit_name_overrides_default_and_env_var(self):
+        # Callers (including tests) that pass an explicit ``name=`` must
+        # continue to win over both the env var and the default - so
+        # adding the new hook cannot regress any existing test.
+        registry = _FakeMutexRegistry()
+        explicit = r"Local\Test\ExplicitNamedMutex"
+        with mock.patch.dict(
+            "os.environ",
+            {single_instance._MUTEX_SUFFIX_ENV: "_Dev"},
+            clear=False,
+        ):
+            with single_instance.BridgeInstanceGuard(
+                name=explicit,
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            ):
+                pass
+        self.assertEqual(registry.create_calls[0], explicit)
 
 
 if __name__ == "__main__":
