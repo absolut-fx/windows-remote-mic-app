@@ -50,6 +50,8 @@ available; only starting the listener does, with a clear error.
 from __future__ import annotations
 
 import ctypes
+import logging
+import os
 import sys
 import threading
 import uuid
@@ -58,6 +60,13 @@ from dataclasses import dataclass, replace
 from typing import Callable, FrozenSet, List, Mapping, Optional, Tuple
 
 from . import hid_identity
+
+# XRBM-020: when OVB_RAW_DUMP=1 is set in the user environment, every raw
+# WM_INPUT body the RC003 listener sees is logged in hex at INFO level so we
+# can map real-device HID reports back to button IDs without owning the BLE
+# GATT collection ourselves. Off by default (silent normal operation).
+_RAW_DUMP_ENABLED = os.environ.get("OVB_RAW_DUMP", "").strip() not in ("", "0", "false")
+_logger = logging.getLogger(__name__)
 
 
 # Module-level (not a function-local class) so tests/test_win32_ctypes_argtypes.py
@@ -412,7 +421,15 @@ class RawInputButtonListener:
         if _run_target is None:
             _require_windows()
         self._device_path = device_path
-        self._normalized_device_path = hid_identity.normalize_device_path(device_path)
+        # device_path=None means "any device" (system-global mode, e.g. for the
+        # in-app key-detection listener that must see Consumer-Control→VK
+        # translations produced by Windows for BLE HID). Production callers
+        # that need exact RC003-hardware scoping still pass a concrete path.
+        self._normalized_device_path = (
+            hid_identity.normalize_device_path(device_path)
+            if device_path is not None
+            else None
+        )
         self._class_name = f"RemoteMicRC003RawInputWindow-{uuid.uuid4().hex}"
         self._stop_event.clear()
         self._ready_event.clear()
@@ -884,13 +901,24 @@ class RawInputButtonListener:
         device_path = _get_device_name(user32, header.hDevice, RIDI_DEVICENAME)
         if not device_path:
             return  # could not resolve a device path for this event at all
-        if hid_identity.normalize_device_path(device_path) != self._normalized_device_path:
-            # Not the exact device path selected at start() - fail-closed
-            # per-event scoping (XRBM-014 review round 2 P1 #4), not merely
-            # "some RC003-VID/PID device".
-            return
-
+        # Even when the listener is hardware-scoped to a specific RC003 device
+        # path, consumer-control translations (Vol+/Vol-/Back) and consumer-page
+        # HID reports arrive on a virtual keyboard whose device path does NOT
+        # match the RC003 receiver's.  Accept those events regardless of source
+        # device so the user can actually press them - the rest of the
+        # dispatch pipeline already validates that the resolved button_id is
+        # one we care about.  See ``KEYBOARD_MAKECODE_TO_BUTTON`` and the HID
+        # usage-page scan in ``_handle_hid_body``.
         body = bytes(buffer.raw[ctypes.sizeof(RAWINPUTHEADER) :])
+        if (
+            self._normalized_device_path is not None
+            and not self._is_consumer_translation_event(header.dwType, body)
+        ):
+            # Hardware-scoped listener + non-consumer event from a different
+            # device path.  Drop per the XRBM-014 review round 2 P1 #4
+            # fail-closed per-event scoping rule - no other listeners should
+            # ever see this event.
+            return
 
         if header.dwType == RIM_TYPEKEYBOARD:
             self._handle_keyboard_body(body, device_path=device_path)
@@ -898,6 +926,52 @@ class RawInputButtonListener:
             self._handle_hid_body(body, device_path=device_path)
         elif header.dwType == RIM_TYPEMOUSE:
             return  # RC003 has no mouse-usage buttons in this candidate
+
+    def _is_consumer_translation_event(self, dw_type: int, body: bytes) -> bool:
+        """Return True if this raw event is a consumer-control translation
+        that Windows repackages onto a virtual keyboard (or HID consumer-page
+        report) rather than the RC003 hardware's own keyboard report.
+
+        ``RIM_TYPEKEYBOARD`` events with VKey=0xFF and a make code that maps
+        to one of our known consumer buttons (Back/Vol+/Vol-/Mute/Power) are
+        the standard Windows translation.  ``RIM_TYPEHID`` reports on the
+        Consumer usage page (0x0C) likewise come from a virtual device path.
+
+        ``RIM_TYPEMOUSE`` is never a consumer translation we care about.
+        """
+        if dw_type == 1:  # RIM_TYPEKEYBOARD
+            # RIM_TYPEKEYBOARD events arrive for any key the OS translates
+            # on the focused device path. The RC003's non-consumer keys
+            # (OK/Mic/Home/Menu/Arrows/Tv) come through as standard
+            # keyboard scan codes that are NOT in
+            # ``KEYBOARD_MAKECODE_TO_BUTTON`` (which only lists the
+            # consumer translations for Vol+/Vol-/Back/Mute/Power). The
+            # downstream ``_handle_keyboard_body`` resolves any unknown
+            # scan code via the ``USAGE_PAGE/SCAN_CODE_TO_BUTTON`` table
+            # and silently ignores anything it cannot resolve, so letting
+            # every keyboard event through is safe and is required for the
+            # nine non-consumer RC003 buttons to dispatch.
+            if len(body) < 16:
+                return False
+            return True
+        if dw_type == 2:  # RIM_TYPEHID
+            # RAWHID: dwSizeHid+u32 (bytes 0-3), dwCount+u32 (bytes 4-7),
+            # bRawData[dwCount][dwSizeHid] starting at offset 8.  Each
+            # report's first byte is the HID usage-page byte for the report
+            # so we peek at the first report (count >= 1, size >= 1).
+            # RC003 sends a Keyboard-page (0x07) keyboard report; Consumer-
+            # page (0x0C) reports come from virtual translations (Win
+            # media keys etc.). Both pass through the device-path scoped
+            # listener so all RC003 buttons dispatch - the consumer-page
+            # check used to drop the 9 keyboard-page buttons entirely.
+            if len(body) < 9:
+                return False
+            import struct as _struct
+            size_hid, count = _struct.unpack_from("<II", body, 0)
+            if count == 0 or size_hid == 0:
+                return False
+            return body[8] in (0x07, 0x0C)
+        return False
 
     def _handle_keyboard_body(
         self, body: bytes, *, device_path: Optional[str] = None
@@ -911,6 +985,19 @@ class RawInputButtonListener:
         _make_code, flags, _reserved, vkey, message, _extra = struct.unpack_from(
             "<HHHHII", body, 0
         )
+        if _RAW_DUMP_ENABLED:
+            _logger.info(
+                "raw dump: type=keyboard device=%s make=0x%04X flags=0x%04X vkey=0x%04X "
+                "reserved=0x%04X message=0x%08X extra=0x%08X body=%s",
+                device_path or "<unknown>",
+                _make_code,
+                flags,
+                vkey,
+                _reserved,
+                message,
+                _extra,
+                body.hex(),
+            )
         button = KEYBOARD_VK_TO_BUTTON.get(vkey)
         if button is None and vkey == 0xFF:
             button = KEYBOARD_MAKECODE_TO_BUTTON.get(_make_code)
@@ -941,6 +1028,13 @@ class RawInputButtonListener:
         try:
             reports = hid_identity.parse_rawinput_hid_payload(body)
         except ValueError as exc:
+            if _RAW_DUMP_ENABLED:
+                _logger.info(
+                    "raw dump: type=hid device=%s body=%s decode_error=%s",
+                    device_path or "<unknown>",
+                    body.hex(),
+                    exc,
+                )
             # Keep malformed input visible to the capture path. It cannot be
             # mapped, but losing it here makes a report-shape mismatch look
             # exactly like a dead button.
@@ -954,6 +1048,13 @@ class RawInputButtonListener:
                 )
             )
             return
+        if _RAW_DUMP_ENABLED:
+            _logger.info(
+                "raw dump: type=hid device=%s body=%s parsed_reports=%d",
+                device_path or "<unknown>",
+                body.hex(),
+                len(reports),
+            )
         for report in reports:
             try:
                 current = hid_identity.decode_report_usages(report)

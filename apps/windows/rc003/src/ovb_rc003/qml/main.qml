@@ -21,7 +21,7 @@ import OvbRc003Settings 1.0
 
 ApplicationWindow {
     id: window
-    title: qsTr("Remote Mic 设置")
+    title: qsTr("Remote Mic Settings")
     width: 900
     height: 680
     minimumWidth: 780
@@ -69,16 +69,16 @@ ApplicationWindow {
 
             TabButton {
                 objectName: "generalTabButton"
-                text: qsTr("通用")
+                text: qsTr("General")
                 Accessible.name: text
             }
             TabButton {
                 objectName: "connectionTabButton"  // test hook: for the rendered contrast regression test
-                text: qsTr("连接")
+                text: qsTr("Connection")
                 Accessible.name: text
                 // Pre-selected so the connection tab is the initial landing page;
-                // preserves the historical "open Settings → land on 连接" UX
-                // even though 通用 is now the leftmost tab.
+                // preserves the historical "open Settings → land on Connection" UX
+                // even though General is now the leftmost tab.
                 Component.onCompleted: checked = true
             }
             TabButton {
@@ -87,12 +87,12 @@ ApplicationWindow {
                 Accessible.name: text
             }
             TabButton {
-                text: qsTr("权限")
+                text: qsTr("Permissions")
                 Accessible.name: text
             }
             TabButton {
                 objectName: "diagnosticsTabButton"  // test hook: for driving this tab in the offscreen screenshot/interaction tests
-                text: qsTr("检查与修复")
+                text: qsTr("Diagnostics")
                 Accessible.name: text
             }
         }
@@ -108,6 +108,33 @@ ApplicationWindow {
             ButtonsPage { tokens: window.tokens }
             PermissionsPage { tokens: window.tokens }
             DiagnosticsPage { tokens: window.tokens }
+        }
+
+        // Footer band: a single thin row at the bottom of the settings
+        // window with a small version label so the user can confirm at a
+        // glance which build of RemoteMicRC003 is currently running. Reads
+        // ``SettingsController.version`` (a ``constant=True`` property bound
+        // to ``ovb_rc003.__version__`` in qt_settings_app.py), so QML never
+        // needs to know the literal version string.
+        Rectangle {
+            Layout.fillWidth: true
+            implicitHeight: 22
+            color: tokens.divider
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: tokens.padMedium
+                anchors.rightMargin: tokens.padMedium
+
+                Item { Layout.fillWidth: true }
+
+                Text {
+                    text: qsTr("RemoteMicRC003 v") + SettingsController.version
+                    color: tokens.textMuted
+                    font.pixelSize: tokens.fontSmall
+                    Accessible.ignored: true
+                }
+            }
         }
     }
 }

@@ -67,7 +67,11 @@ class _FakeStartupFolder:
     # Production stores ``str(target_exe)`` as-recorded (without re-
     # resolving) and compares against the same string on the next
     # enable, so mirror that: record ``str(target)`` verbatim.
-    def create_link(self, target: Path, link: Path) -> None:
+    # ``extra_args`` is the optional bridge-mode command line; tests
+    # here don't need to assert on it, so we accept and ignore.
+    def create_link(
+        self, target: Path, link: Path, extra_args: str = ""
+    ) -> None:
         key = str(link)
         self.links[key] = str(target)
         # Also touch the file on disk so ``link.exists()`` returns True
@@ -236,7 +240,9 @@ class EnableFailureModesTests(unittest.TestCase):
     def test_enable_returns_failed_when_create_link_raises(self) -> None:
         fake, kw = _make_fake()
 
-        def broken_create_link(target: Path, link: Path) -> None:
+        def broken_create_link(
+            target: Path, link: Path, extra_args: str = ""
+        ) -> None:
             raise OSError("disk full")
 
         result = startup_shortcut.enable(
@@ -382,6 +388,130 @@ class RealPowerShellRoundtripTests(unittest.TestCase):
             startup_shortcut.StartupShortcutOutcome.DISABLED,
         )
         self.assertFalse(startup_shortcut.is_enabled())
+
+
+class BridgeShortcutTests(unittest.TestCase):
+    """Two named shortcuts (default + bridge) coexist in the same
+    Startup folder. The default auto-start keeps its historical
+    behaviour unchanged; the bridge auto-start uses a separate
+    shortcut file and a separate ``--bridge`` command line so the
+    launched process boots headless rather than opening the settings
+    window. All four operations (enable/disable/is_enabled/shortcut_
+    path) accept ``name=`` and ``extra_args=`` and don't cross-talk.
+    """
+
+    def test_bridge_shortcut_lives_alongside_default(self) -> None:
+        fake, kw = _make_fake()
+        target = Path("C:/Program Files/RC003/RemoteMicRC003.exe")
+        enable_kw = _kw_for(startup_shortcut.enable, kw)
+
+        # Enable BOTH auto-starts. They must produce distinct shortcut
+        # files and distinct outcomes.
+        main_result = startup_shortcut.enable(target, **enable_kw)
+        bridge_result = startup_shortcut.enable(
+            target,
+            name=startup_shortcut._BRIDGE_STARTUP_FOLDER_NAME,
+            extra_args="--bridge",
+            **{
+                k: v
+                for k, v in enable_kw.items()
+                if k
+                not in ("name", "extra_args")
+            },
+        )
+
+        self.assertEqual(
+            main_result.outcome,
+            startup_shortcut.StartupShortcutOutcome.ENABLED,
+        )
+        self.assertEqual(
+            bridge_result.outcome,
+            startup_shortcut.StartupShortcutOutcome.ENABLED,
+        )
+        # Two distinct .lnk files were created in the same folder.
+        paths = sorted(str(p) for p in fake.links.keys())
+        self.assertEqual(len(paths), 2)
+        self.assertTrue(
+            any("RemoteMicRC003.lnk" in p for p in paths),
+            paths,
+        )
+        self.assertTrue(
+            any("RemoteMicRC003-Bridge.lnk" in p for p in paths),
+            paths,
+        )
+
+        # Toggling only the bridge must not flip the default.
+        is_enabled_main = startup_shortcut.is_enabled(
+            **_kw_for(
+                startup_shortcut.is_enabled,
+                kw,
+            )
+        )
+        is_enabled_bridge = startup_shortcut.is_enabled(
+            name=startup_shortcut._BRIDGE_STARTUP_FOLDER_NAME,
+            **_kw_for(
+                startup_shortcut.is_enabled,
+                kw,
+            ),
+        )
+        self.assertTrue(is_enabled_main)
+        self.assertTrue(is_enabled_bridge)
+
+        # Disable ONLY the bridge; default must stay enabled.
+        bridge_disable_kw = _kw_for(startup_shortcut.disable, kw)
+        bridge_disable_kw["name"] = (
+            startup_shortcut._BRIDGE_STARTUP_FOLDER_NAME
+        )
+        disabled = startup_shortcut.disable(**bridge_disable_kw)
+        self.assertEqual(
+            disabled.outcome,
+            startup_shortcut.StartupShortcutOutcome.DISABLED,
+        )
+        self.assertTrue(
+            startup_shortcut.is_enabled(
+                **_kw_for(
+                    startup_shortcut.is_enabled,
+                    kw,
+                )
+            )
+        )
+        self.assertFalse(
+            startup_shortcut.is_enabled(
+                name=startup_shortcut._BRIDGE_STARTUP_FOLDER_NAME,
+                **_kw_for(
+                    startup_shortcut.is_enabled,
+                    kw,
+                ),
+            )
+        )
+
+        # Tidy up so we never leave a default autostart on the host.
+        cleanup_kw = _kw_for(startup_shortcut.disable, kw)
+        startup_shortcut.disable(**cleanup_kw)
+
+    def test_default_api_calls_unchanged(self) -> None:
+        """Backward-compat guard: ``enable(target)`` with no kwargs
+        must still write the historical ``RemoteMicRC003.lnk`` and
+        pass ``extra_args=""``. Existing call sites and tests rely
+        on this signature.
+        """
+        fake, kw = _make_fake()
+        enable_kw = _kw_for(startup_shortcut.enable, kw)
+        target = Path("C:/Program Files/RC003/RemoteMicRC003.exe")
+        result = startup_shortcut.enable(target, **enable_kw)
+        self.assertEqual(
+            result.outcome,
+            startup_shortcut.StartupShortcutOutcome.ENABLED,
+        )
+        paths = list(fake.links.keys())
+        self.assertEqual(len(paths), 1)
+        self.assertTrue(
+            str(paths[0]).endswith("RemoteMicRC003.lnk"),
+            paths[0],
+        )
+        # Clean up so we don't leave an autostart shortcut behind.
+        cleanup_kw = _kw_for(startup_shortcut.disable, kw)
+        startup_shortcut.disable(**cleanup_kw)
 
 
 if __name__ == "__main__":

@@ -112,6 +112,7 @@ class LegacyKeySuppressor:
             Callable[[int, bool], Optional[PhysicalKeyTarget]]
         ] = None,
         on_key_emit: Optional[Callable[[PhysicalKeyTarget, bool], bool]] = None,
+        on_key_observe: Optional[Callable[[int, int, bool], None]] = None,
         *,
         rc003_vk_codes: Optional[FrozenSet[int]] = None,
         consume_wait_seconds: float = 0.060,
@@ -123,6 +124,13 @@ class LegacyKeySuppressor:
         # real Win32 input edge. Returning False keeps the original event
         # swallowed while allowing the application to use its fallback path.
         self._on_key_emit = on_key_emit
+        # Fires for EVERY physical key the low-level hook observes (after
+        # LLKHF_INJECTED is filtered, but BEFORE the suppression decision).
+        # Use this when the app needs to react to a key that the hook must
+        # NOT swallow (e.g. VK_VOLUME_UP/DOWN so Windows still updates its
+        # volume OSD while the app's bindings also dispatch).  Returning
+        # None or raising is safe - the hook thread logs and continues.
+        self._on_key_observe = on_key_observe
         # The RC003 keyboard surface is a small, known set of VK codes. The
         # low-level hook only ever needs to wait for an arming Raw Input edge
         # for those codes; every other keyboard (and any other key) must pass
@@ -494,6 +502,42 @@ class LegacyKeySuppressor:
             wintypes.LPARAM,
         )
         user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        # TEMPORARY DIAGNOSTIC (RC003 keys-not-firing investigation): log every
+        # message that the low-level keyboard hook sees so we can determine
+        # whether Vol+/Vol-/Back arrive as WM_KEYDOWN, WM_APPCOMMAND, or
+        # nothing at all. This runs only when the module logger is at INFO.
+        # After we identify the right message type, this branch gets replaced
+        # by a focused handler that forwards to on_key_observe.
+        if n_code >= 0:
+            int_w = int(w_param)
+            int_l = int(l_param)
+            if int_w in (
+                WM_KEYDOWN,
+                WM_KEYUP,
+                WM_SYSKEYDOWN,
+                WM_SYSKEYUP,
+                0x0319,  # WM_APPCOMMAND
+            ):
+                if int_w == 0x0319:
+                    appcmd = (int_l >> 16) & 0xFFFF
+                    _logger.info(
+                        "hook msg: wparam=0x%04X(WM_APPCOMMAND) "
+                        "appcmd=0x%02X lparam=0x%08X",
+                        int_w,
+                        appcmd,
+                        int_l,
+                    )
+                else:
+                    event_dbg = KBDLLHOOKSTRUCT.from_address(int_l)
+                    _logger.info(
+                        "hook msg: wparam=0x%04X vk=0x%02X flags=0x%X "
+                        "scan=0x%X ext=%s",
+                        int_w,
+                        int(event_dbg.vkCode),
+                        int(event_dbg.flags),
+                        int(event_dbg.scanCode),
+                        bool(int(event_dbg.flags) & 1),
+                    )
         if n_code >= 0 and int(w_param) in (
             WM_KEYDOWN,
             WM_KEYUP,
@@ -512,6 +556,17 @@ class LegacyKeySuppressor:
                 finally:
                     event.flags = original_flags
                     event.dwExtraInfo = original_extra_info
+            if self._on_key_observe is not None:
+                try:
+                    self._on_key_observe(
+                        int(event.vkCode),
+                        int(event.scanCode),
+                        bool(int(event.flags) & LLKHF_EXTENDED),
+                        is_pressed,
+                    )
+                except Exception:
+                    # Never let an observer crash the global hook thread.
+                    pass
             if self.should_suppress(event.vkCode, event.flags):
                 if self._on_key_transform is not None:
                     try:

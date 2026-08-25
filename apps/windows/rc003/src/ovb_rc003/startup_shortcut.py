@@ -61,6 +61,13 @@ _CSIDL_STARTUP = 0x0007
 # any future log output. Windows reads both names correctly.
 _STARTUP_FOLDER_NAME = "RemoteMicRC003"
 
+# A second, distinct shortcut file for the headless ``--bridge`` auto-start
+# toggle. The settings-window toggle uses ``_STARTUP_FOLDER_NAME`` (above),
+# so the two live side-by-side in the Startup folder without colliding.
+# Naming keeps the protected-token substring "RemoteMicRC003" intact for
+# the upstream public-boundary scanner.
+_BRIDGE_STARTUP_FOLDER_NAME = "RemoteMicRC003-Bridge"
+
 # Extension for a shell link (LNK) file - Windows shell refuses to follow
 # a shortcut with any other extension, so this MUST be ".lnk".
 _SHORTCUT_EXTENSION = ".lnk"
@@ -203,18 +210,29 @@ def _default_startup_folder() -> Path:
 # surface as ``OSError`` which the public API maps to ``FAILED``.
 
 
-def _powershell_create_shortcut(target: Path, link: Path) -> None:
+def _powershell_create_shortcut(
+    target: Path, link: Path, extra_args: str = ""
+) -> None:
     """Create ``link`` pointing at ``target`` via PowerShell.
+
+    ``extra_args`` is appended to the shortcut's ``Arguments``
+    property; pass ``""`` for shortcuts that just launch the EXE
+    (the historical behaviour, preserved for the settings-window
+    auto-start) and e.g. ``"--bridge"`` for the headless bridge
+    auto-start. Shell-quoted so spaces survive the round-trip into
+    PowerShell's ``$sc.Arguments``.
 
     Raises ``OSError`` on any failure - PowerShell non-zero exit,
     missing shortcut file after a successful run, etc. Runs
     ``-NoProfile -NonInteractive`` so the user's PowerShell profile
     can't poison our execution environment.
     """
+    arguments_literal = "''" if extra_args == "" else f"'{_ps_quote(extra_args)}'"
     script = (
         f"$ws = New-Object -ComObject '{_WSHELL_PROGID}'; "
         f"$sc = $ws.CreateShortcut('{_ps_quote(str(link))}'); "
         f"$sc.TargetPath = '{_ps_quote(str(target))}'; "
+        f"$sc.Arguments = {arguments_literal}; "
         f"$sc.WorkingDirectory = '{_ps_quote(str(target.parent))}'; "
         f"$sc.WindowStyle = 1; "  # SW_SHOWNORMAL
         f"$sc.Save(); "
@@ -322,18 +340,22 @@ def _ps_quote(s: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _default_create_link(target_exe: Path, link_path: Path) -> None:
+def _default_create_link(
+    target_exe: Path, link_path: Path, extra_args: str = ""
+) -> None:
     """Create ``link_path`` pointing at ``target_exe``.
 
     Thin wrapper around ``_powershell_create_shortcut`` so the public
     API can inject a different implementation in tests without
-    dragging the PowerShell layer with it.
+    dragging the PowerShell layer with it. ``extra_args`` is passed
+    through to the PowerShell layer (see
+    ``_powershell_create_shortcut`` for the meaning of the value).
 
     Raises ``OSError`` if PowerShell fails or the link file is not on
     disk after the call returns. Callers (``enable()``) translate this
     to a ``FAILED`` ``StartupShortcutResult``.
     """
-    _powershell_create_shortcut(target_exe, link_path)
+    _powershell_create_shortcut(target_exe, link_path, extra_args)
 
 
 def _default_remove_file(path: Path) -> None:
@@ -367,20 +389,32 @@ def _default_resolve_link_target(
 def enable(
     target_exe: Path,
     *,
+    name: str = _STARTUP_FOLDER_NAME,
+    extra_args: str = "",
     _startup_folder: Callable[[], Path] = _default_startup_folder,
-    _create_link: Callable[[Path, Path], None] = _default_create_link,
+    _create_link: Callable[[Path, Path, str], None] = _default_create_link,
     _resolve_link_target: Callable[[Path], Optional[Path]] = (
         _default_resolve_link_target
     ),
 ) -> StartupShortcutResult:
     """Place a startup-folder shortcut pointing at ``target_exe``.
 
+    ``name`` selects which shortcut file to write (the default keeps
+    the historical ``RemoteMicRC003.lnk`` for the settings-window
+    auto-start; the bridge auto-start passes
+    ``_BRIDGE_STARTUP_FOLDER_NAME`` to write a separate ``.lnk`` so
+    the two coexist in the Startup folder). ``extra_args`` is
+    appended verbatim to the shortcut's command line (the bridge
+    mode passes ``--bridge`` so the launched process boots the
+    headless bridge rather than opening the settings window).
+
     Idempotent: if the shortcut already exists and points at
-    ``target_exe``, returns ``ALREADY_ENABLED`` instead of rewriting
-    it (avoiding the shortcut's mtime changing under the user, which
-    would look like the toggle was flipped twice). If the existing
-    shortcut points at a different target, it is replaced with one
-    pointing at ``target_exe``.
+    ``target_exe`` (with matching ``extra_args``), returns
+    ``ALREADY_ENABLED`` instead of rewriting it (avoiding the
+    shortcut's mtime changing under the user, which would look like
+    the toggle was flipped twice). If the existing shortcut points
+    at a different target or different args, it is replaced with one
+    matching ``target_exe`` and ``extra_args``.
 
     Returns ``FAILED`` if any OS call raises. Callers (the UI) should
     surface ``result.message`` to the user and not throw further.
@@ -395,7 +429,7 @@ def enable(
             target_path=str(target_exe),
         )
 
-    link_path = folder / f"{_STARTUP_FOLDER_NAME}{_SHORTCUT_EXTENSION}"
+    link_path = folder / f"{name}{_SHORTCUT_EXTENSION}"
 
     if link_path.exists():
         existing_target = _resolve_link_target(link_path)
@@ -404,14 +438,22 @@ def enable(
             or str(existing_target).lower()
             == str(target_exe).lower()
         ):
-            return StartupShortcutResult(
-                outcome=StartupShortcutOutcome.ALREADY_ENABLED,
-                message="开机自启动已启用。",
-                target_path=str(target_exe),
-            )
+            # Target matches - re-check the args; if they don't match
+            # we must rewrite the shortcut. We only know the target
+            # path here (the resolver does not return arguments); the
+            # easy correct behaviour is: if no extra_args were
+            # requested, treat as already-enabled; if extra_args were
+            # requested, rewrite so we don't silently leave an old
+            # command line in place.
+            if extra_args == "":
+                return StartupShortcutResult(
+                    outcome=StartupShortcutOutcome.ALREADY_ENABLED,
+                    message="开机自启动已启用。",
+                    target_path=str(target_exe),
+                )
 
     try:
-        _create_link(target_exe, link_path)
+        _create_link(target_exe, link_path, extra_args)
     except OSError as exc:
         return StartupShortcutResult(
             outcome=StartupShortcutOutcome.FAILED,
@@ -421,17 +463,24 @@ def enable(
 
     return StartupShortcutResult(
         outcome=StartupShortcutOutcome.ENABLED,
-        message="已启用开机自启动。",
+        message="已启用开机自启动。" if extra_args == ""
+        else "已启用开机自动启动桥接模式。",
         target_path=str(target_exe),
     )
 
 
 def disable(
     *,
+    name: str = _STARTUP_FOLDER_NAME,
     _startup_folder: Callable[[], Path] = _default_startup_folder,
     _remove_file: Callable[[Path], None] = _default_remove_file,
 ) -> StartupShortcutResult:
     """Remove the startup-folder shortcut if present.
+
+    ``name`` selects which shortcut file to remove (default keeps
+    backward compatibility with the historical
+    ``RemoteMicRC003.lnk``; bridge auto-start passes the bridge
+    shortcut name).
 
     Idempotent: if no shortcut exists, returns ``ALREADY_DISABLED``
     rather than failing.
@@ -444,11 +493,13 @@ def disable(
             message=f"无法获取启动文件夹：{exc}",
         )
 
-    link_path = folder / f"{_STARTUP_FOLDER_NAME}{_SHORTCUT_EXTENSION}"
+    link_path = folder / f"{name}{_SHORTCUT_EXTENSION}"
     if not link_path.exists():
         return StartupShortcutResult(
             outcome=StartupShortcutOutcome.ALREADY_DISABLED,
-            message="开机自启动已关闭。",
+            message="开机自启动已关闭。"
+            if name == _STARTUP_FOLDER_NAME
+            else "开机自动启动桥接模式已关闭。",
         )
 
     try:
@@ -461,41 +512,46 @@ def disable(
 
     return StartupShortcutResult(
         outcome=StartupShortcutOutcome.DISABLED,
-        message="已关闭开机自启动。",
+        message="已关闭开机自启动。"
+        if name == _STARTUP_FOLDER_NAME
+        else "已关闭开机自动启动桥接模式。",
     )
 
 
 def is_enabled(
     *,
+    name: str = _STARTUP_FOLDER_NAME,
     _startup_folder: Callable[[], Path] = _default_startup_folder,
 ) -> bool:
-    """True iff the startup-folder shortcut exists.
+    """True iff the named startup-folder shortcut exists.
 
-    Used by the settings UI on window open to sync the toggle's
+    Used by the settings UI on window open to sync each toggle's
     checked state to reality. Failure here is non-fatal: returns
-    False so the UI shows the toggle OFF (which is the safe default -
-    the user will enable it explicitly if they want it).
+    False so the UI shows the toggle OFF (which is the safe default
+    - the user will enable it explicitly if they want it).
     """
     try:
         folder = _startup_folder()
     except OSError:
         return False
-    link_path = folder / f"{_STARTUP_FOLDER_NAME}{_SHORTCUT_EXTENSION}"
+    link_path = folder / f"{name}{_SHORTCUT_EXTENSION}"
     return link_path.exists()
 
 
 def shortcut_path(
     *,
+    name: str = _STARTUP_FOLDER_NAME,
     _startup_folder: Callable[[], Path] = _default_startup_folder,
 ) -> Path:
     """Return the on-disk shortcut path, whether or not it exists.
 
     Useful for the settings UI's "Show in Explorer" affordance - the
     path is always well-defined and the UI can offer to reveal it
-    even when the shortcut is currently absent.
+    even when the shortcut is currently absent. ``name`` selects
+    which shortcut to address (see ``enable`` / ``disable``).
     """
     folder = _startup_folder()
-    return folder / f"{_STARTUP_FOLDER_NAME}{_SHORTCUT_EXTENSION}"
+    return folder / f"{name}{_SHORTCUT_EXTENSION}"
 
 
 __all__ = [

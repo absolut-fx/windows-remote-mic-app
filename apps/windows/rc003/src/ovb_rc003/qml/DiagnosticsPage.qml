@@ -484,11 +484,17 @@ Item {
                     onClicked: SettingsController.openAppsSettings()
                 }
                 Button {
-                    id: diagnosticsOpenLogButton
-                    objectName: "diagnosticsOpenLogButton"
-                    text: qsTr("打开日志目录")
-                    onClicked: SettingsController.openLogLocation()
+                    id: diagnosticsViewLogButton
+                    objectName: "diagnosticsViewLogButton"
+                    text: qsTr("查看日志")
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("直接打开 app.log 文件（通常用记事本显示当前日志内容）")
+                    onClicked: SettingsController.openLogFile()
                 }
+                // Note: the "打开日志目录" button lives on ConnectionPage so users
+                // can open the log folder from the same place they enable logging.
+                // This page keeps only the in-file view (above) to avoid a duplicate
+                // action that opens the same folder from two tabs.
             }
 
             Item { Layout.preferredHeight: tokens.spacingLarge }

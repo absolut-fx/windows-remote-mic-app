@@ -1,15 +1,29 @@
-"""Windows named-mutex single-instance guard for bridge mode (XRBM-021).
+"""Windows named-mutex single-instance guard (XRBM-021; settings window
+addition is a follow-on, not a new XRBM task - the guard infrastructure
+is shared, only the per-mode mutex name differs).
 
 The no-argument bridge (``python -m ovb_rc003`` / the packaged
 ``RemoteMicRC003.exe``) is a long-lived, mostly invisible owner of
 BLE, Raw Input, synthetic key and audio resources. Starting a second
 instance in the same Windows logon session would race both instances over
 those resources - so at most one bridge instance may hold them at a time.
-``--settings``, ``--dry-run`` and help/version inspection never touch those
+
+The default (no-argument) settings window mode also claims a per-session
+named mutex of its own, for a different reason: a user who double-clicks
+the Start Menu shortcut twice in quick succession (or who clicks the
+shortcut while the previous settings window is still running) would
+otherwise open TWO settings windows racing over the same QML scene graph
+and configuration-file writes. The settings-window guard uses a SEPARATE
+mutex name (``Local\\RemoteMicRC003_SettingsInstance``) from the bridge
+guard (``Local\\RemoteMicRC003_BridgeInstance``), so a running bridge
+does NOT block opening the settings window to configure/stop it, and
+vice-versa.
+
+``--dry-run`` and help/version inspection never touch any of those
 resources at all and must remain available regardless of whether the
-bridge is already running - this guard is therefore only ever constructed
-around bridge-mode startup (see ``__main__.py``), never around those other
-modes.
+bridge or settings window is already running - this guard is therefore
+only ever constructed around bridge-mode or settings-window startup (see
+``__main__.py``), never around those other modes.
 
 Fail-closed contract (XRBM-021 review round 1 P1 #1): a caller that cannot
 PROVE it is the sole owner - whether because another instance already owns
@@ -67,17 +81,25 @@ from typing import Callable, List, NamedTuple, Optional
 # Windows logon session, matching the task's "per-session/local name"
 # requirement - a second bridge started by a different logged-in user (or
 # in a different session) is not this guard's concern.
-_MUTEX_BASE_NAME = r"Local\RemoteMicRC003_BridgeInstance"
+_BRIDGE_MUTEX_BASE_NAME = r"Local\RemoteMicRC003_BridgeInstance"
+# Settings-window mutex lives in its own, deliberately-distinct named
+# object (not a flag on the bridge mutex) so a running bridge does NOT
+# block opening the settings window to inspect/stop it, and a settings
+# window does not falsely report "another instance is already running"
+# just because the bridge daemon is healthy in the background.
+_SETTINGS_MUTEX_BASE_NAME = r"Local\RemoteMicRC003_SettingsInstance"
 
 # Env-var hook for side-by-side development builds (audit/batch1): when
 # REMOTEMIC_RC003_INSTANCE_SUFFIX is set to a non-empty, identifier-safe
-# string, the default mutex name gets that string appended (e.g. "_Dev")
-# so a source-tree ``python -m ovb_rc003 --bridge`` does not collide with
-# the installed ``RemoteMicRC003.exe``'s bridge. Production launches
-# leave the variable unset, so the shipped build keeps claiming exactly
-# the same named mutex it always has. Honored by ``_default_mutex_name``
-# only - ``BridgeInstanceGuard.__init__``'s ``name`` parameter continues
-# to default through that helper, so any caller that already passes an
+# string, BOTH default mutex names (bridge AND settings) get that string
+# appended (e.g. "_Dev") so a source-tree ``python -m ovb_rc003`` does not
+# collide with the installed ``RemoteMicRC003.exe`` - whether launched in
+# bridge or default-settings mode. Production launches leave the variable
+# unset, so the shipped build keeps claiming exactly the same named
+# mutexes it always has. Honored by ``_default_bridge_mutex_name`` /
+# ``_default_settings_mutex_name`` only - ``BridgeInstanceGuard.__init__``
+# and ``SettingsInstanceGuard.__init__``'s ``name`` parameter continue to
+# default through those helpers, so any caller that already passes an
 # explicit ``name=`` (e.g. tests via ``BridgeInstanceGuard(name="...")``)
 # is unaffected.
 _MUTEX_SUFFIX_ENV = "REMOTEMIC_RC003_INSTANCE_SUFFIX"
@@ -88,38 +110,58 @@ _MUTEX_SUFFIX_ENV = "REMOTEMIC_RC003_INSTANCE_SUFFIX"
 _ALLOWED_SUFFIX_CHARS = frozenset("_-.")
 
 
-def _default_mutex_name() -> str:
-    """Return the bridge mutex name to use for this process.
+def _suffix_mutex_name(base: str) -> str:
+    """Apply ``REMOTEMIC_RC003_INSTANCE_SUFFIX`` to ``base``.
 
-    Honors ``REMOTEMIC_RC003_INSTANCE_SUFFIX`` for side-by-side
-    development builds (see ``_MUTEX_SUFFIX_ENV``): the shipped executable
-    never sets it, so production runs always take ``_MUTEX_BASE_NAME``;
-    a source-tree dev launch sets it (e.g. to ``_Dev``), which is
-    appended verbatim so the dev build claims a different named mutex
-    than the installed app and the two never trip the
-    ``DuplicateInstanceError`` fail-closed branch.
-
-    An unset, empty, or whitespace-only suffix falls back to the base
-    name (matching how ``config_root()`` already treats an unset
-    ``LOCALAPPDATA``). A suffix containing anything outside the
-    identifier-safe subset (``_``, ``-``, ``.`` plus alphanumerics) is
-    rejected and falls back to the base name, so a misconfigured dev
-    environment can never inject a suffix that breaks mutex lookup on
-    Windows (which has its own rules around backslash, etc.). The
-    hard-coded ``_MUTEX_BASE_NAME`` itself is NEVER validated through
-    here - that constant has been the only mutex this app has ever used
-    and changing it would itself be a behavior change.
+    An unset, empty, or whitespace-only suffix returns ``base`` unchanged
+    (matching how ``config_root()`` already treats an unset ``LOCALAPPDATA``).
+    A suffix containing anything outside the identifier-safe subset (``_``,
+    ``-``, ``.`` plus alphanumerics) is rejected and also returns ``base``
+    unchanged, so a misconfigured dev environment can never inject a
+    suffix that breaks mutex lookup on Windows (which has its own rules
+    around backslash, etc.). The hard-coded ``_BRIDGE_MUTEX_BASE_NAME``
+    itself is NEVER validated through here - those constants have been
+    the only mutexes this app has ever used and changing them would itself
+    be a behavior change.
     """
 
     suffix = os.environ.get(_MUTEX_SUFFIX_ENV)
     if not suffix:
-        return _MUTEX_BASE_NAME
+        return base
     suffix = suffix.strip()
     if not suffix:
-        return _MUTEX_BASE_NAME
+        return base
     if any(ch not in _ALLOWED_SUFFIX_CHARS and not ch.isalnum() for ch in suffix):
-        return _MUTEX_BASE_NAME
-    return _MUTEX_BASE_NAME + suffix
+        return base
+    return base + suffix
+
+
+def _default_bridge_mutex_name() -> str:
+    """Return the bridge mutex name to use for this process.
+
+    Honors ``REMOTEMIC_RC003_INSTANCE_SUFFIX`` for side-by-side
+    development builds (see ``_MUTEX_SUFFIX_ENV``): the shipped executable
+    never sets it, so production runs always take ``_BRIDGE_MUTEX_BASE_NAME``;
+    a source-tree dev launch sets it (e.g. to ``_Dev``), which is
+    appended verbatim so the dev build claims a different named mutex
+    than the installed app and the two never trip the
+    ``DuplicateInstanceError`` fail-closed branch.
+    """
+
+    return _suffix_mutex_name(_BRIDGE_MUTEX_BASE_NAME)
+
+
+def _default_settings_mutex_name() -> str:
+    """Return the settings-window mutex name to use for this process.
+
+    Independent from ``_default_bridge_mutex_name`` (separate mutex
+    objects by design - see module docstring), but honors the same
+    ``REMOTEMIC_RC003_INSTANCE_SUFFIX`` dev-suffix contract so a
+    source-tree settings window does not collide with an
+    installed-copy settings window when the dev suffix is set.
+    """
+
+    return _suffix_mutex_name(_SETTINGS_MUTEX_BASE_NAME)
 
 # https://learn.microsoft.com/windows/win32/debug/system-error-codes--0-499-
 _ERROR_ALREADY_EXISTS = 183
@@ -284,10 +326,10 @@ class BridgeInstanceGuard:
         # ``REMOTEMIC_RC003_INSTANCE_SUFFIX`` env var at the moment the
         # guard is constructed (not at module-import time). Tests that
         # want to freeze a specific name continue to pass ``name=...``
-        # explicitly; ``_default_mutex_name()`` only runs in the
+        # explicitly; ``_default_bridge_mutex_name()`` only runs in the
         # no-explicit-name path.
         if name is None:
-            name = _default_mutex_name()
+            name = _default_bridge_mutex_name()
         self._name = name
         self._create_mutex = _create_mutex
         self._release_mutex = _release_mutex
@@ -361,6 +403,124 @@ class BridgeInstanceGuard:
         return None if closed else "CloseHandle returned FALSE"
 
 
+class SettingsInstanceGuard:
+    """Owns (or fails to own) the per-session settings-window
+    single-instance mutex.
+
+    Same acquire/duplicate/release/cleanup contract as
+    ``BridgeInstanceGuard`` - a deliberate sibling, not a subclass,
+    because the only meaningful difference is which named mutex each one
+    claims by default. They share no per-instance state and tests already
+    exercise both through the same ``_FakeMutexRegistry`` (just pointing
+    at a different named object). Inheriting would force the bridge
+    tests to filter out an "isinstance still BridgeInstanceGuard" check
+    that nothing currently asserts, and would muddy the "two independent
+    named objects" design rationale for no observable benefit.
+
+    Use as a context manager around settings-window startup::
+
+        with SettingsInstanceGuard():
+            settings_window.show()
+
+    - First owner: ``__enter__`` returns normally; ``__exit__`` always
+      attempts ``ReleaseMutex`` THEN ``CloseHandle`` (best-effort - one
+      failing never skips the other), INCLUDING when the wrapped body
+      raises. A cleanup failure ALWAYS raises ``MutexCleanupError`` -
+      even when the wrapped body itself also raised. Python chains the
+      body exception onto ``__context__`` automatically (see
+      ``MutexCleanupError``'s docstring), so both are observable.
+    - Duplicate owner: ``CreateMutexW`` hands back a valid handle to the
+      EXISTING object (Win32 semantics - the caller does not become the
+      owner), so ``__enter__`` closes that handle immediately and raises
+      ``DuplicateInstanceError`` before the body ever runs.
+    - Acquisition failure (``CreateMutexW`` itself failed, e.g. access
+      denied): ``__enter__`` raises ``SingleInstanceUnavailableError``.
+
+    Every raised message deliberately omits the raw handle value - only
+    Win32 error codes and fixed diagnostic strings ever appear in them.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str = None,
+        _create_mutex: CreateMutexFn = _real_create_mutex,
+        _release_mutex: ReleaseMutexFn = _real_release_mutex,
+        _close_handle: CloseHandleFn = _real_close_handle,
+    ) -> None:
+        # Same lazy-default contract as ``BridgeInstanceGuard`` - default
+        # resolved at construction time, not at module-import time, so
+        # ``REMOTEMIC_RC003_INSTANCE_SUFFIX`` can still vary per process.
+        if name is None:
+            name = _default_settings_mutex_name()
+        self._name = name
+        self._create_mutex = _create_mutex
+        self._release_mutex = _release_mutex
+        self._close_handle = _close_handle
+        self._handle: Optional[int] = None
+
+    def __enter__(self) -> "SettingsInstanceGuard":
+        result = self._create_mutex(self._name)
+        if not result.handle:
+            raise SingleInstanceUnavailableError(
+                f"CreateMutexW failed (GetLastError={result.last_error})"
+            )
+        if result.last_error == _ERROR_ALREADY_EXISTS:
+            close_failure = self._safe_close(result.handle)
+            message = (
+                "another Remote Mic RC003 settings window is already "
+                "running in this Windows session"
+            )
+            if close_failure:
+                message += f" (additionally, {close_failure})"
+            raise DuplicateInstanceError(message)
+        self._handle = result.handle
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        handle = self._handle
+        self._handle = None
+        if not handle:
+            return None
+
+        failures: List[str] = []
+        release_failure = self._safe_release(handle)
+        if release_failure:
+            failures.append(release_failure)
+        # Always attempted, regardless of whether release itself raised or
+        # returned FALSE - one cleanup step's failure must never skip the
+        # other.
+        close_failure = self._safe_close(handle)
+        if close_failure:
+            failures.append(close_failure)
+
+        if failures:
+            # Unconditional - even if the body (exc_type is not None) also
+            # raised. Python automatically chains that body exception onto
+            # __context__, so this never has to choose between the two.
+            raise MutexCleanupError(
+                "mutex cleanup did not fully succeed: " + "; ".join(failures)
+            )
+        return None
+
+    def _safe_release(self, handle: int) -> Optional[str]:
+        # Same fixed-text contract as ``BridgeInstanceGuard._safe_release``
+        # - underlying exception message is deliberately never
+        # interpolated (it could itself contain a raw handle value).
+        try:
+            released = self._release_mutex(handle)
+        except Exception:  # noqa: BLE001 - must not skip the close step below
+            return "ReleaseMutex raised an exception"
+        return None if released else "ReleaseMutex returned FALSE"
+
+    def _safe_close(self, handle: int) -> Optional[str]:
+        try:
+            closed = self._close_handle(handle)
+        except Exception:  # noqa: BLE001
+            return "CloseHandle raised an exception"
+        return None if closed else "CloseHandle returned FALSE"
+
+
 def _real_message_box(title: str, message: str) -> int:
     _require_windows()
     user32 = ctypes.windll.user32  # type: ignore[attr-defined]
@@ -373,16 +533,18 @@ def _real_message_box(title: str, message: str) -> int:
     return user32.MessageBoxW(None, message, title, _MB_OK | _MB_ICONWARNING | _MB_SYSTEMMODAL)
 
 
-def show_bridge_startup_blocked_notice(
+def show_startup_blocked_notice(
     message: str,
     *,
     title: str = "Remote Mic · RC003",
     _message_box: Callable[[str, str], int] = _real_message_box,
 ) -> None:
-    """Shows a visible Windows message box for a bridge launch the
+    """Shows a visible Windows message box for a launch the
     single-instance guard blocked - either a proven duplicate or an
     acquisition failure it could not resolve (XRBM-021 In-scope item 3;
-    fail-closed contract in the module docstring). The packaged executable
+    fail-closed contract in the module docstring). Used by both the
+    bridge path and the settings-window path; the message text passed
+    in tells the user which mode was blocked. The packaged executable
     is windowed (``console=False`` in build/RemoteMicRC003.spec), so
     stdout/stderr are never visible to the user there - a message box is
     the only reliable user-visible signal. Off-Windows, or if the Win32
@@ -395,3 +557,11 @@ def show_bridge_startup_blocked_notice(
         _message_box(title, message)
     except Exception:
         print(f"Remote Mic RC003: {message}", file=sys.stderr)
+
+
+# Backward-compatible alias retained so the existing
+# ``_run_bridge()`` call site in ``__main__.py`` (and any future callers
+# that import by the old name) keep compiling without churn. The name is
+# the only thing kept; behavior is the new ``show_startup_blocked_notice``
+# above. New code should use the new name.
+show_bridge_startup_blocked_notice = show_startup_blocked_notice

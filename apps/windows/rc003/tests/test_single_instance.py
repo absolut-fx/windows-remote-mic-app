@@ -60,6 +60,18 @@ class _FakeMutexRegistry:
             _close_handle=self.close_handle,
         )
 
+    def settings_guard(self):
+        """Mirror of ``guard()`` that constructs a SettingsInstanceGuard
+        bound to the same fake registry. Lets the settings-mode tests
+        below exercise the same shared-mutex semantics as the bridge
+        tests without duplicating the registry's plumbing.
+        """
+        return single_instance.SettingsInstanceGuard(
+            _create_mutex=self.create_mutex,
+            _release_mutex=self.release_mutex,
+            _close_handle=self.close_handle,
+        )
+
 
 class BridgeInstanceGuardAcquisitionTests(unittest.TestCase):
     def test_first_owner_acquires_successfully(self):
@@ -502,8 +514,8 @@ class DefaultMutexNameTests(unittest.TestCase):
 
             os.environ.pop(single_instance._MUTEX_SUFFIX_ENV, None)
             self.assertEqual(
-                single_instance._default_mutex_name(),
-                single_instance._MUTEX_BASE_NAME,
+                single_instance._default_bridge_mutex_name(),
+                single_instance._BRIDGE_MUTEX_BASE_NAME,
             )
 
     def test_empty_value_returns_base_name(self):
@@ -511,8 +523,8 @@ class DefaultMutexNameTests(unittest.TestCase):
             "os.environ", {single_instance._MUTEX_SUFFIX_ENV: ""}, clear=False
         ):
             self.assertEqual(
-                single_instance._default_mutex_name(),
-                single_instance._MUTEX_BASE_NAME,
+                single_instance._default_bridge_mutex_name(),
+                single_instance._BRIDGE_MUTEX_BASE_NAME,
             )
 
     def test_whitespace_only_value_returns_base_name(self):
@@ -520,8 +532,8 @@ class DefaultMutexNameTests(unittest.TestCase):
             "os.environ", {single_instance._MUTEX_SUFFIX_ENV: "   "}, clear=False
         ):
             self.assertEqual(
-                single_instance._default_mutex_name(),
-                single_instance._MUTEX_BASE_NAME,
+                single_instance._default_bridge_mutex_name(),
+                single_instance._BRIDGE_MUTEX_BASE_NAME,
             )
 
     def test_dev_suffix_appends_to_base_name(self):
@@ -531,8 +543,8 @@ class DefaultMutexNameTests(unittest.TestCase):
             clear=False,
         ):
             self.assertEqual(
-                single_instance._default_mutex_name(),
-                single_instance._MUTEX_BASE_NAME + "_Dev",
+                single_instance._default_bridge_mutex_name(),
+                single_instance._BRIDGE_MUTEX_BASE_NAME + "_Dev",
             )
 
     def test_alphanumeric_dev_suffix_is_honored(self):
@@ -542,8 +554,8 @@ class DefaultMutexNameTests(unittest.TestCase):
             clear=False,
         ):
             self.assertEqual(
-                single_instance._default_mutex_name(),
-                single_instance._MUTEX_BASE_NAME + "Dev01",
+                single_instance._default_bridge_mutex_name(),
+                single_instance._BRIDGE_MUTEX_BASE_NAME + "Dev01",
             )
 
     def test_dangerous_suffix_characters_fall_back_to_base_name(self):
@@ -557,8 +569,8 @@ class DefaultMutexNameTests(unittest.TestCase):
                 clear=False,
             ):
                 self.assertEqual(
-                    single_instance._default_mutex_name(),
-                    single_instance._MUTEX_BASE_NAME,
+                    single_instance._default_bridge_mutex_name(),
+                    single_instance._BRIDGE_MUTEX_BASE_NAME,
                     msg=f"bad suffix {bad!r} should have fallen back to base name",
                 )
 
@@ -585,7 +597,7 @@ class BridgeInstanceGuardUsesDefaultMutexNameTests(unittest.TestCase):
                 pass
         self.assertEqual(len(registry.create_calls), 1)
         self.assertEqual(
-            registry.create_calls[0], single_instance._MUTEX_BASE_NAME + "_Dev"
+            registry.create_calls[0], single_instance._BRIDGE_MUTEX_BASE_NAME + "_Dev"
         )
 
     def test_explicit_name_overrides_default_and_env_var(self):
@@ -607,6 +619,238 @@ class BridgeInstanceGuardUsesDefaultMutexNameTests(unittest.TestCase):
             ):
                 pass
         self.assertEqual(registry.create_calls[0], explicit)
+
+
+class SettingsInstanceGuardAcquisitionTests(unittest.TestCase):
+    def test_first_owner_acquires_successfully(self):
+        registry = _FakeMutexRegistry()
+        with registry.settings_guard() as guard:
+            self.assertIsNotNone(guard)
+        self.assertEqual(len(registry.create_calls), 1)
+
+    def test_uses_a_local_session_scoped_mutex_name_by_default(self):
+        registry = _FakeMutexRegistry()
+        with registry.settings_guard():
+            pass
+        self.assertTrue(registry.create_calls[0].startswith("Local\\"))
+
+    def test_first_owner_releases_then_closes_on_clean_exit(self):
+        registry = _FakeMutexRegistry()
+        with registry.settings_guard():
+            pass
+        self.assertEqual(len(registry.release_calls), 1)
+        self.assertEqual(len(registry.close_calls), 1)
+        self.assertEqual(registry.release_calls[0], registry.close_calls[0])
+
+    def test_release_happens_before_close_deterministically(self):
+        order = []
+        registry = _FakeMutexRegistry()
+
+        def release(handle):
+            order.append(("release", handle))
+            return True
+
+        def close(handle):
+            order.append(("close", handle))
+            return True
+
+        guard = single_instance.SettingsInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=release,
+            _close_handle=close,
+        )
+        with guard:
+            pass
+        self.assertEqual([kind for kind, _handle in order], ["release", "close"])
+
+    def test_first_owner_releases_even_when_the_wrapped_body_raises(self):
+        registry = _FakeMutexRegistry()
+        with self.assertRaises(RuntimeError):
+            with registry.settings_guard():
+                raise RuntimeError("simulated settings startup failure")
+        self.assertEqual(len(registry.release_calls), 1)
+        self.assertEqual(len(registry.close_calls), 1)
+
+    def test_close_still_runs_if_release_itself_raises(self):
+        registry = _FakeMutexRegistry()
+
+        def failing_release(handle):
+            raise OSError("simulated ReleaseMutex failure")
+
+        guard = single_instance.SettingsInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=failing_release,
+            _close_handle=registry.close_handle,
+        )
+        with self.assertRaises(single_instance.MutexCleanupError) as ctx:
+            with guard:
+                pass
+        self.assertEqual(len(registry.close_calls), 1)
+        self.assertIn("ReleaseMutex raised", str(ctx.exception))
+
+
+class SettingsInstanceGuardCleanupFailureObservabilityTests(unittest.TestCase):
+    """Settings-mode mirror of
+    ``BridgeInstanceGuardCleanupFailureObservabilityTests`` - the cleanup
+    observability contract (XRBM-021 review round 1 P1 #3) is the same
+    for both guards because it lives in the shared ``__exit__``/``_safe_*``
+    code path, not in the per-mode mutex name selection."""
+
+    def test_release_returning_false_raises_mutex_cleanup_error(self):
+        registry = _FakeMutexRegistry()
+        registry.release_mutex = lambda handle: False
+        guard = single_instance.SettingsInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=registry.release_mutex,
+            _close_handle=registry.close_handle,
+        )
+        with self.assertRaises(single_instance.MutexCleanupError) as ctx:
+            with guard:
+                pass
+        self.assertIn("ReleaseMutex returned FALSE", str(ctx.exception))
+        self.assertEqual(len(registry.close_calls), 1)
+
+    def test_close_returning_false_raises_mutex_cleanup_error(self):
+        registry = _FakeMutexRegistry()
+        registry.close_handle = lambda handle: False
+        guard = single_instance.SettingsInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=registry.release_mutex,
+            _close_handle=registry.close_handle,
+        )
+        with self.assertRaises(single_instance.MutexCleanupError) as ctx:
+            with guard:
+                pass
+        self.assertIn("CloseHandle returned FALSE", str(ctx.exception))
+
+    def test_cleanup_failure_message_never_contains_the_raw_handle_value(self):
+        plausible_handle = 0x0000_0140_0000_1000
+        registry = _FakeMutexRegistry()
+        registry._next_handle = plausible_handle
+        registry.release_mutex = lambda handle: False
+        registry.close_handle = lambda handle: False
+        guard = single_instance.SettingsInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=registry.release_mutex,
+            _close_handle=registry.close_handle,
+        )
+        with self.assertRaises(single_instance.MutexCleanupError) as ctx:
+            with guard:
+                pass
+        message = str(ctx.exception)
+        self.assertNotIn(str(plausible_handle), message)
+        self.assertNotIn(hex(plausible_handle), message)
+        self.assertNotIn(f"{plausible_handle:x}", message)
+
+
+class SettingsInstanceGuardDuplicateTests(unittest.TestCase):
+    """Settings-mode mirror of
+    ``BridgeInstanceGuardDuplicateTests`` - same shared-mutex semantics,
+    distinct default mutex name (the whole point of the refactor: two
+    settings windows must collide on the SAME settings mutex; a settings
+    window and a bridge must NOT collide on each other's mutex)."""
+
+    def test_two_concurrent_settings_launches_cannot_both_own_the_mutex(self):
+        registry = _FakeMutexRegistry()
+        with registry.settings_guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with registry.settings_guard():
+                    self.fail("the duplicate guard's body must never run")
+
+    def test_duplicate_closes_its_own_handle_but_never_releases_it(self):
+        registry = _FakeMutexRegistry()
+        with registry.settings_guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with registry.settings_guard():
+                    pass
+        # First owner: 1 release + 1 close. Duplicate: 1 close, 0 release.
+        self.assertEqual(len(registry.release_calls), 1)
+        self.assertEqual(len(registry.close_calls), 2)
+
+
+class SettingsInstanceGuardAcquisitionFailureTests(unittest.TestCase):
+    def test_null_handle_raises_unavailable_error(self):
+        def failing_create(_name):
+            return single_instance.MutexCreationResult(handle=0, last_error=5)  # ERROR_ACCESS_DENIED
+
+        guard = single_instance.SettingsInstanceGuard(
+            _create_mutex=failing_create,
+            _release_mutex=lambda h: True,
+            _close_handle=lambda h: True,
+        )
+        with self.assertRaises(single_instance.SingleInstanceUnavailableError):
+            with guard:
+                self.fail("must not enter on acquisition failure")
+
+
+class SettingsInstanceGuardUsesDefaultMutexNameTests(unittest.TestCase):
+    """End-to-end: a ``SettingsInstanceGuard()`` constructed with no
+    ``name=`` argument picks up ``REMOTEMIC_RC003_INSTANCE_SUFFIX`` at
+    construction time and threads the suffixed name into
+    ``CreateMutexW`` - mirrors the bridge-mode equivalent for the
+    settings mutex base."""
+
+    def test_default_name_is_suffixed_when_env_var_set(self):
+        registry = _FakeMutexRegistry()
+        with mock.patch.dict(
+            "os.environ",
+            {single_instance._MUTEX_SUFFIX_ENV: "_Dev"},
+            clear=False,
+        ):
+            with single_instance.SettingsInstanceGuard(
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            ):
+                pass
+        self.assertEqual(len(registry.create_calls), 1)
+        self.assertEqual(
+            registry.create_calls[0],
+            single_instance._SETTINGS_MUTEX_BASE_NAME + "_Dev",
+        )
+
+    def test_explicit_name_overrides_default_and_env_var(self):
+        registry = _FakeMutexRegistry()
+        explicit = r"Local\Test\ExplicitSettingsNamedMutex"
+        with mock.patch.dict(
+            "os.environ",
+            {single_instance._MUTEX_SUFFIX_ENV: "_Dev"},
+            clear=False,
+        ):
+            with single_instance.SettingsInstanceGuard(
+                name=explicit,
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            ):
+                pass
+        self.assertEqual(registry.create_calls[0], explicit)
+
+
+class SettingsAndBridgeMutexesAreDistinctTests(unittest.TestCase):
+    """Smoke test for the refactor's core invariant: a settings window
+    and a bridge running in the same Windows session must NOT collide
+    on each other's mutex - they are different modes of the same .exe
+    and are expected to coexist (e.g. user clicks the Start Menu
+    shortcut twice: one settings window opens, one bridge starts; or
+    one of each)."""
+
+    def test_default_bridge_and_settings_mutex_names_differ(self):
+        self.assertNotEqual(
+            single_instance._default_bridge_mutex_name(),
+            single_instance._default_settings_mutex_name(),
+        )
+
+    def test_default_bridge_and_settings_base_names_differ(self):
+        self.assertNotEqual(
+            single_instance._BRIDGE_MUTEX_BASE_NAME,
+            single_instance._SETTINGS_MUTEX_BASE_NAME,
+        )
+
+    def test_default_settings_mutex_name_starts_with_local_session_scope(self):
+        self.assertTrue(
+            single_instance._default_settings_mutex_name().startswith("Local\\")
+        )
 
 
 if __name__ == "__main__":

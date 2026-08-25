@@ -681,6 +681,285 @@ class SettingsControllerTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class BridgeAutoStartControllerTests(unittest.TestCase):
+    """New ``bridgeAutoStart`` property + ``setBridgeAutoStart`` slot.
+
+    Mirrors the existing autostart toggle shape but writes a separate
+    shortcut file (``RemoteMicRC003-Bridge.lnk`` with ``--bridge``
+    arg) so settings-window auto-start and bridge auto-start can be
+    on/off independently.
+
+    These tests deliberately DO NOT touch the disk shortcut at all -
+    ``startup_shortcut.enable``/``disable``/``is_enabled`` are
+    monkeypatched to record the call args, so the test stays platform-
+    agnostic and does not require PowerShell, a real Windows
+    %APPDATA%\\Microsoft\\Windows\\Start Menu\\Startup folder, or a
+    frozen build. The point is to prove the controller calls the
+    right helper with the right arguments, NOT to prove PowerShell
+    can write a .lnk file - that already has its own dedicated tests
+    in tests/test_startup_shortcut.py.
+    """
+
+    def setUp(self):
+        classes = qt_settings_app._load_qt_classes()
+        self.Model = classes["ButtonMappingModel"]
+        self.Controller = classes["SettingsController"]
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._env_patch = mock.patch.dict(
+            os.environ, {"LOCALAPPDATA": self._tmpdir.name}
+        )
+        self._env_patch.start()
+        # Monkey-patch startup_shortcut at the controller's import site.
+        # The controller captured ``startup_shortcut`` as a module-level
+        # binding inside qt_settings_app, so we have to patch the name
+        # there (not at the original startup_shortcut module).
+        from ovb_rc003 import startup_shortcut as real_sc
+        self._real_sc = real_sc
+        self._patcher_enable = mock.patch.object(
+            qt_settings_app.startup_shortcut, "enable", autospec=True
+        )
+        self._patcher_disable = mock.patch.object(
+            qt_settings_app.startup_shortcut, "disable", autospec=True
+        )
+        self._patcher_is_enabled = mock.patch.object(
+            qt_settings_app.startup_shortcut, "is_enabled", autospec=True
+        )
+        self.fake_enable = self._patcher_enable.start()
+        self.fake_disable = self._patcher_disable.start()
+        self.fake_is_enabled = self._patcher_is_enabled.start()
+        # Default state: nothing enabled. The fake tracks disk truth
+        # for us: ``enable()`` flips it to True, ``disable()`` to
+        # False - exactly what a real Windows Startup-folder write
+        # would do (production controller code calls
+        # ``is_enabled()`` right after a successful enable/disable
+        # to update the UI, so we have to mimic that side effect).
+        self._disk_state = {"bridge": False, "default": False}
+
+        def fake_is_enabled(name=None, **_kwargs):
+            if name == self._real_sc._BRIDGE_STARTUP_FOLDER_NAME:
+                return self._disk_state["bridge"]
+            return self._disk_state["default"]
+
+        from ovb_rc003.startup_shortcut import StartupShortcutOutcome
+
+        def fake_enable(_target_exe, **_kwargs):
+            name = _kwargs.get("name", self._real_sc._STARTUP_FOLDER_NAME)
+            if name == self._real_sc._BRIDGE_STARTUP_FOLDER_NAME:
+                self._disk_state["bridge"] = True
+            else:
+                self._disk_state["default"] = True
+            return real_sc.StartupShortcutResult(
+                outcome=StartupShortcutOutcome.ENABLED,
+                message="已启用。",
+            )
+
+        def fake_disable(name=None, **_kwargs):
+            if name == self._real_sc._BRIDGE_STARTUP_FOLDER_NAME:
+                self._disk_state["bridge"] = False
+            else:
+                self._disk_state["default"] = False
+            return real_sc.StartupShortcutResult(
+                outcome=StartupShortcutOutcome.DISABLED,
+                message="已禁用。",
+            )
+
+        self.fake_is_enabled.side_effect = fake_is_enabled
+        self.fake_enable.side_effect = fake_enable
+        self.fake_disable.side_effect = fake_disable
+
+    def tearDown(self):
+        self._patcher_enable.stop()
+        self._patcher_disable.stop()
+        self._patcher_is_enabled.stop()
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def _make_controller(self):
+        model = self.Model()
+        controller = self.Controller(model)
+        return controller, model
+
+    def test_bridge_auto_start_defaults_to_false(self):
+        controller, _ = self._make_controller()
+        self.assertFalse(controller.bridgeAutoStart)
+        self.assertEqual(controller.bridgeAutoStartStatusText, "")
+        self.assertFalse(controller.bridgeAutoStartStatusIsError)
+
+    def test_set_bridge_auto_start_true_calls_enable_with_bridge_name_and_arg(self):
+        """The whole point of this task: confirm the @Slot(bool)
+        decorator works (round-1 root cause was a bare @Slot() above a
+        bool-arg function), AND that ``enable`` is called with the
+        bridge shortcut name + ``--bridge`` extra_args."""
+        controller, _ = self._make_controller()
+        controller.setBridgeAutoStart(True)
+        self.fake_enable.assert_called_once()
+        call_kwargs = self.fake_enable.call_args.kwargs
+        # Must use the bridge shortcut name (NOT the default).
+        self.assertEqual(
+            call_kwargs.get("name"),
+            self._real_sc._BRIDGE_STARTUP_FOLDER_NAME,
+            "setBridgeAutoStart(True) must call enable with name="
+            "_BRIDGE_STARTUP_FOLDER_NAME, got %r" % call_kwargs.get("name"),
+        )
+        # Must pass --bridge extra_args.
+        self.assertEqual(
+            call_kwargs.get("extra_args"),
+            "--bridge",
+            "setBridgeAutoStart(True) must call enable with extra_args="
+            "--bridge, got %r" % call_kwargs.get("extra_args"),
+        )
+        # Must NOT have written a config.json entry (autostart is
+        # tracked by the .lnk file, not the JSON config).
+        self.assertFalse(controller.bridgeAutoStartStatusIsError)
+        # Once enable returns SUCCESS, the controller's cached state
+        # should flip to True.
+        self.assertTrue(controller.bridgeAutoStart)
+        self.assertIn("已加入开机启动", controller.bridgeAutoStartStatusText)
+
+    def test_set_bridge_auto_start_false_calls_disable_with_bridge_name(self):
+        controller, _ = self._make_controller()
+        # Seed state so the setter has work to do (it short-circuits when
+        # target == cached == disk).
+        controller._bridge_auto_start = True
+        controller.setBridgeAutoStart(False)
+        self.fake_disable.assert_called_once_with(
+            name=self._real_sc._BRIDGE_STARTUP_FOLDER_NAME
+        )
+        self.assertFalse(controller.bridgeAutoStart)
+        self.assertIn("未加入开机启动", controller.bridgeAutoStartStatusText)
+
+    def test_set_bridge_auto_start_independent_of_settings_window_toggle(self):
+        """Toggling the bridge MUST NOT call enable/disable for the
+        default RemoteMicRC003 shortcut, and vice versa."""
+        controller, _ = self._make_controller()
+        controller.setBridgeAutoStart(True)
+        # Bridge was toggled.
+        self.fake_enable.assert_called_once()
+        kwargs = self.fake_enable.call_args.kwargs
+        self.assertEqual(
+            kwargs.get("name"),
+            self._real_sc._BRIDGE_STARTUP_FOLDER_NAME,
+        )
+        self.fake_disable.reset_mock()
+        # Default shortcut must NOT have been touched.
+        for call in self.fake_disable.call_args_list:
+            self.assertNotEqual(
+                call.kwargs.get("name"),
+                self._real_sc._BRIDGE_STARTUP_FOLDER_NAME,
+            )
+        # And vice versa: a settings-window toggle must not touch the
+        # bridge shortcut.
+        controller._start_with_windows = False
+        self.fake_enable.reset_mock()
+        self.fake_disable.reset_mock()
+        controller.setStartWithWindows(True)
+        # All enable() / disable() calls for the default name MUST
+        # use the default name, NOT the bridge name.
+        for call in self.fake_enable.call_args_list:
+            self.assertNotEqual(
+                call.kwargs.get("name"),
+                self._real_sc._BRIDGE_STARTUP_FOLDER_NAME,
+            )
+        for call in self.fake_disable.call_args_list:
+            self.assertNotEqual(
+                call.kwargs.get("name"),
+                self._real_sc._BRIDGE_STARTUP_FOLDER_NAME,
+            )
+
+    def test_set_bridge_auto_start_slot_accepts_bool_argument(self):
+        """Round-1 root-cause regression guard: ``setBridgeAutoStart``
+        must be callable with a Python ``bool`` and reach the
+        controller's setter. If the @Slot decorator ever drops the
+        ``(bool)`` annotation, PySide6 will swallow the argument and
+        this test's call to ``setBridgeAutoStart(True)`` would be a
+        no-op - the asserts below would then fail because
+        ``fake_enable`` was never called.
+        """
+        controller, _ = self._make_controller()
+        result = controller.setBridgeAutoStart(True)
+        self.assertIsNone(result)
+        self.fake_enable.assert_called_once()
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class OpenLogFileControllerTests(unittest.TestCase):
+    """``openLogFile()`` QML slot must call ``logging_setup.open_log_file``
+    (not ``open_log_location``) and surface the result via the
+    controller's status-message property.
+
+    Sits next to ``BridgeAutoStartControllerTests`` but uses a simpler
+    headless setup (no QGuiApplication needed - the controller is
+    constructed and the slot is invoked directly).
+    """
+
+    def setUp(self):
+        classes = qt_settings_app._load_qt_classes()
+        self.Model = classes["ButtonMappingModel"]
+        self.Controller = classes["SettingsController"]
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._env_patch = mock.patch.dict(
+            os.environ, {"LOCALAPPDATA": self._tmpdir.name}
+        )
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def test_open_log_file_slot_invokes_open_log_file_and_publishes_status(self):
+        from ovb_rc003 import logging_setup as ls
+        from ovb_rc003 import settings_ui as sui
+
+        # Real log dir + file exists.
+        log_dir = self._tmpdir.name + "\\logs"
+        Path(log_dir).mkdir()
+        log_file = Path(log_dir) / "app.log"
+        log_file.write_text("entry\n", encoding="utf-8")
+
+        captured: list = []
+        fake_result = ls.LogOpenResult(
+            outcome=ls.LogOpenOutcome.OPENED,
+            location=ls.LogLocation(
+                status=ls.LogLocationStatus.READY,
+                directory=Path(log_dir),
+                file_path=log_file,
+            ),
+        )
+
+        with mock.patch.object(
+            ls, "open_log_file", return_value=fake_result
+        ) as fake_open_file:
+            model = self.Model()
+            controller = self.Controller(model)
+            # Capture the message the controller would show in the status
+            # bar (real QML will bind to ``statusMessage``).
+            with mock.patch.object(
+                controller, "_set_status_message", side_effect=captured.append
+            ) as fake_status:
+                controller.openLogFile()
+
+        fake_open_file.assert_called_once_with()
+        fake_status.assert_called_once()
+        # Status text comes from settings_ui.describe_log_open_result,
+        # which we trust (its own unit tests cover all four outcomes).
+        msg = captured[0]
+        self.assertIn("已打开", msg)
+        self.assertEqual(
+            sui.describe_log_open_result(fake_result),
+            msg,
+        )
+
+    def test_open_log_file_slot_distinct_from_open_log_location_slot(self):
+        """Sanity: the slot exists and is named ``openLogFile`` (not
+        ``openLogLocation``). Catches accidental rename regressions."""
+        controller = self.Controller(self.Model())
+        self.assertTrue(hasattr(controller, "openLogFile"))
+        self.assertTrue(callable(controller.openLogFile))
+        # And the existing slot is still there.
+        self.assertTrue(hasattr(controller, "openLogLocation"))
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
 class DiagnosticsControllerTests(unittest.TestCase):
     """DiagnosticsController (XRBM-031) runs every check on a background
     thread and delivers results via a cross-thread Qt signal - unlike
