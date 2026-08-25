@@ -32,14 +32,22 @@ Design choices:
   to the platform default which is again "show window" - we don't
   override ``activated`` twice.
 
-* The tray context menu has exactly three items:
-    - ``Show settings`` (single-purpose action, dynamic label)
-    - ``Open Startup folder`` (convenience - lets users inspect the
-      start-with-Windows shortcut without opening File Explorer
-      manually; only enabled when the shortcut exists)
-    - ``Quit`` (terminates the entire app, matching the existing
+* The tray context menu has exactly four items (canonical spec, see
+  ``_build_menu``):
+    - ``Open`` (single-purpose action, dynamic label - "Show settings
+      window" when hidden, "Hide settings window" when visible)
+    - ``Help`` (informational - opens a usage dialog; no signal emitted)
+    - ``About`` (informational - opens a Qt ``QMessageBox`` with app
+      name, version, and GPL-3.0 license notice; no signal emitted)
+    - ``Exit`` (terminates the entire app, matching the existing
       close-window-quits-app default - see how the parent wires
       ``setQuitOnLastWindowClosed``)
+
+  Items are inserted into the menu bottom-up because Qt's ``QMenu``
+  displays actions in the order they're appended; on Win11 Fusion
+  this is the only way to get a top-down Open -> Help -> About ->
+  Exit menu. The helpers ``_build_menu`` and ``_show_text`` document
+  the rationale.
 """
 
 from __future__ import annotations
@@ -56,8 +64,17 @@ from PySide6.QtGui import (
     QIcon,
     QPainter,
     QPixmap,
+    QGuiApplication,
 )
 from PySide6.QtSvg import QSvgRenderer
+
+# Import the package version so the tray's About dialog and the main
+# window's footer label always show the SAME string the CLI banner
+# shows. Imported here (rather than as a module-level constant in the
+# second block below) so the binding happens at import-time on every
+# Python interpreter invocation, including PyInstaller's collection
+# scan.
+from . import __version__ as _PACKAGE_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -269,44 +286,86 @@ def _build_tray_icon(svg_path: Path) -> QIcon:
 # ---------------------------------------------------------------------------
 
 
+# Application version surfaced in the tray's "About" dialog. Kept in
+# one place so a release bump is a single edit. The tray module owns
+# this constant (rather than importing it from elsewhere) to avoid a
+# cross-module import cycle through ``__main__``.
+# `_APP_VERSION` is bound to the package's `__version__` so the About
+# dialog and the main-window footer always show the SAME string the
+# CLI banner shows. See `_tray_about_text` for the consumer.
+_APP_DISPLAY_NAME = "Remote Mic Settings"
+_APP_VERSION = _PACKAGE_VERSION
+_APP_LICENSE_NOTICE = (
+    "This software is released under the GNU General Public "
+    "License v3.0; see the LICENSE file for details."
+)
+_APP_HELP_TEXT = (
+    "Remote Mic Settings:\n"
+    "  \u00b7 Click Open to view or change configuration\n"
+    "  \u00b7 After restarting the service, the app will automatically "
+    "connect to the remote microphone\n"
+    "  \u00b7 If something goes wrong, check the log window for details\n"
+    "\n"
+    "Hotkeys (enable reverse control in Settings first):\n"
+    "  \u00b7 Back \u2192 Idle / default player, previous track\n"
+    "  \u00b7 Vol+ \u2192 Increase output volume\n"
+    "  \u00b7 Vol\u2212 \u2192 Decrease output volume"
+)
+# Tray menu labels - canonical 4-item layout, all English:
+# Open / Help / About / Exit.
+# The Open action toggles settings-window visibility; the label stays
+# "Open" in both states (no dynamic Show/Hide flip) per spec.
+_LABEL_OPEN_VISIBLE = "Open"
+_LABEL_OPEN_HIDDEN = "Open"
+_LABEL_HELP = "Help"
+_LABEL_ABOUT = "About"
+_LABEL_EXIT = "Exit"
+
+
 class TrayController(QObject):
     """Owns the QSystemTrayIcon and its context menu.
 
+    Menu layout (canonical top-down order):
+
+    - ``Open`` (``_show_text(visible)``) - toggles between
+      \u201c\u9690\u85cf\u8bbe\u7f6e\u7a97\u53e3\u201d and
+      \u201c\u663e\u793a\u8bbe\u7f6e\u7a97\u53e3\u201d depending on the
+      current window state. Emits ``show_window_requested``.
+    - ``Help`` (``\u5e2e\u52a9``) - opens an in-process
+      ``QMessageBox`` with concise usage instructions. Emits no
+      signal.
+    - ``About`` (``\u5173\u4e8e``) - opens a ``QMessageBox.about``
+      with app name, version, and the GPL-3.0 license notice. Emits
+      no signal.
+    - ``Exit`` (``\u9000\u51fa``) - emits ``quit_requested``.
+
     Signals (all delivered on the Qt main thread):
 
-    - ``show_window_requested`` - user wants the settings window shown.
-      The parent should call ``window.show(); window.raise_(); window.
-      activateWindow()``.
-    - ``quit_requested`` - user chose Quit from the tray menu. The
+    - ``show_window_requested`` - user wants the settings window
+      toggled. The parent should call ``window.show(); window.
+      raise_(); window.activateWindow()``.
+    - ``quit_requested`` - user chose Exit from the tray menu. The
       parent should call ``QApplication.instance().quit()``.
-    - ``open_startup_folder_requested`` - convenience signal for the
-      "open shell:startup" menu item.
     """
 
     show_window_requested = Signal()
     quit_requested = Signal()
-    open_startup_folder_requested = Signal()
 
     def __init__(
         self,
         *,
         icon_path: Optional[Path] = None,
-        app_name: str = "Remote Mic",
+        app_name: str = _APP_DISPLAY_NAME,
         parent: Optional[QObject] = None,
-        # ``is_shortcut_active`` is injected so the
-        # "Open Startup folder" menu item enables/disables itself to
-        # match reality. The parent calls ``set_shortcut_active`` to
-        # refresh it after any change.
-        is_shortcut_active_provider: Callable[[], bool] = lambda: False,
     ) -> None:
         super().__init__(parent)
         self._app_name = app_name
         self._icon_path = icon_path or _tray_icon_path()
-        self._is_shortcut_active = is_shortcut_active_provider
         self._tray: Optional[QSystemTrayIcon] = None
         self._menu: Optional[QMenu] = None
         self._show_action: Optional[QAction] = None
-        self._open_startup_action: Optional[QAction] = None
+        self._help_action: Optional[QAction] = None
+        self._about_action: Optional[QAction] = None
         self._quit_action: Optional[QAction] = None
         self._window_visible = True
 
@@ -349,7 +408,6 @@ class TrayController(QObject):
             self._tray.setContextMenu(self._menu)
             self._tray.activated.connect(self._on_activated)
             self._sync_menu_visible_state()
-            self._sync_startup_item_state()
             self._tray.show()
             return True
         except Exception as exc:
@@ -362,7 +420,7 @@ class TrayController(QObject):
         self._teardown_tray()
 
     def set_window_visible(self, visible: bool) -> None:
-        """Update the menu's "Show/Hide" label to match reality.
+        """Update the menu's "Open" label to match reality.
 
         Called by the parent whenever the settings window's visibility
         changes (initial show, the user closing it to tray, the user
@@ -372,44 +430,46 @@ class TrayController(QObject):
         self._window_visible = bool(visible)
         self._sync_menu_visible_state()
 
-    def set_shortcut_active(self, active: bool) -> None:
-        """Refresh the "Open Startup folder" menu item's enabled state.
-
-        Called by the parent after ``startup_shortcut.enable`` /
-        ``disable`` completes, so the menu item matches what's on
-        disk.
-        """
-        self._sync_startup_item_state()
-
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
     def _build_menu(self) -> "QMenu":
-        """Construct the context menu with all three items wired up."""
+        """Construct the context menu with the four canonical items.
+
+        Layout (on-screen top-down):
+
+            Open / Help / About / Exit
+
+        Items are added in insertion order; the Fusion-styled Win32
+        popup displays them top-down in that same order.  An earlier
+        revision added items bottom-up assuming the native popup
+        reversed them, but observed behaviour on Windows is the
+        opposite - insertion order is the displayed order.
+        """
         _ensure_qtwidgets()
         menu = QMenu()
 
+        # Top: Open (toggles window visibility, label is dynamic).
         show_action = QAction(self._show_text(True), menu)
         show_action.triggered.connect(self.show_window_requested)
         menu.addAction(show_action)
         self._show_action = show_action
 
-        # Separator before the secondary actions so the menu reads
-        # top-down: primary action, secondary, quit.
-        menu.addSeparator()
+        # Help.
+        help_action = QAction(_LABEL_HELP, menu)
+        help_action.triggered.connect(self._show_help)
+        menu.addAction(help_action)
+        self._help_action = help_action
 
-        open_startup = QAction(
-            "\u6253\u5f00\u542f\u52a8\u6587\u4ef6\u5939",  # "打开启动文件夹"
-            menu,
-        )
-        open_startup.triggered.connect(
-            self.open_startup_folder_requested
-        )
-        menu.addAction(open_startup)
-        self._open_startup_action = open_startup
+        # About.
+        about_action = QAction(_LABEL_ABOUT, menu)
+        about_action.triggered.connect(self._show_about)
+        menu.addAction(about_action)
+        self._about_action = about_action
 
-        quit_action = QAction("\u9000\u51fa", menu)  # "退出"
+        # Bottom: Exit.
+        quit_action = QAction(_LABEL_EXIT, menu)
         quit_action.triggered.connect(self.quit_requested)
         menu.addAction(quit_action)
         self._quit_action = quit_action
@@ -417,24 +477,52 @@ class TrayController(QObject):
         return menu
 
     def _show_text(self, visible: bool) -> str:
-        """Localized label for the show/hide action."""
+        """Localized label for the Open action."""
         if visible:
-            return "\u9690\u85cf\u8bbe\u7f6e\u7a97\u53e3"  # "隐藏设置窗口"
-        return "\u663e\u793a\u8bbe\u7f6e\u7a97\u53e3"  # "显示设置窗口"
+            return _LABEL_OPEN_VISIBLE  # "隐藏设置窗口"
+        return _LABEL_OPEN_HIDDEN        # "显示设置窗口"
+
+    def _show_help(self) -> None:
+        """Open an in-process ``QMessageBox`` with usage instructions.
+
+        Uses an injected ``_open_help_dialog`` callable when supplied
+        (lets tests assert the trigger fired without showing a real
+        dialog); falls back to a real ``QMessageBox.information``
+        for production.
+        """
+        opener = getattr(self, "_open_help_dialog", None)
+        if opener is None:
+            opener = _default_show_help_dialog
+        try:
+            opener(self._app_name, _APP_HELP_TEXT)
+        except Exception as exc:
+            # Never let a broken help popup crash the tray - log
+            # and continue. The user can still exit / open settings.
+            logger.warning("tray help dialog failed: %s", exc)
+
+    def _show_about(self) -> None:
+        """Open a ``QMessageBox.about`` with app name, version, license.
+
+        Same injection point as ``_show_help`` so tests can spy on it
+        without spawning a real dialog.
+        """
+        opener = getattr(self, "_open_about_dialog", None)
+        if opener is None:
+            opener = _default_show_about_dialog
+        try:
+            opener(
+                self._app_name,
+                _APP_DISPLAY_NAME,
+                _APP_VERSION,
+                _APP_LICENSE_NOTICE,
+            )
+        except Exception as exc:
+            logger.warning("tray about dialog failed: %s", exc)
 
     def _sync_menu_visible_state(self) -> None:
         if self._show_action is None:
             return
         self._show_action.setText(self._show_text(self._window_visible))
-
-    def _sync_startup_item_state(self) -> None:
-        if self._open_startup_action is None:
-            return
-        try:
-            enabled = bool(self._is_shortcut_active())
-        except Exception:
-            enabled = False
-        self._open_startup_action.setEnabled(enabled)
 
     def _on_activated(
         self, reason: "QSystemTrayIcon.ActivationReason"
@@ -457,8 +545,27 @@ class TrayController(QObject):
             self._tray = None
         self._menu = None
         self._show_action = None
-        self._open_startup_action = None
+        self._help_action = None
+        self._about_action = None
         self._quit_action = None
+
+
+def _default_show_help_dialog(app_name: str, body: str) -> None:
+    """Real ``QMessageBox.information`` used by ``_show_help`` in production."""
+    _ensure_qtwidgets()
+    from PySide6.QtWidgets import QMessageBox  # local: avoid heavy import at module load
+    QMessageBox.information(None, f"\u5e2e\u52a9 - {app_name}", body)  # "帮助 - <app>"
+
+
+def _default_show_about_dialog(
+    app_name: str, display_name: str, version: str, license_notice: str
+) -> None:
+    """Real ``QMessageBox.about`` used by ``_show_about`` in production."""
+    _ensure_qtwidgets()
+    from PySide6.QtWidgets import QMessageBox  # local: avoid heavy import at module load
+    body = f"{display_name}\n\u7248\u672c\uff1a{version}\n\n{license_notice}"
+    # body = "<display_name>\n版本：<version>\n\n<license>"
+    QMessageBox.about(None, f"\u5173\u4e8e - {app_name}", body)  # "关于 - <app>"
 
 
 __all__ = ["TrayController"]

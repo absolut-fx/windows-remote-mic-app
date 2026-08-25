@@ -411,7 +411,21 @@ def describe_stop_result(result: bridge_launcher.StopResult) -> str:
 
 
 def describe_log_open_result(result: logging_setup.LogOpenResult) -> str:
+    """Translate a ``LogOpenResult`` into a one-line human message.
+
+    Covers all four outcomes: directory-level open, file-level open,
+    file missing (only relevant for ``open_log_file``), and a hard
+    open failure. The directory-open message intentionally mentions
+    the directory, and the file-open message intentionally mentions
+    the file - users care which one actually happened.
+    """
     if result.outcome is logging_setup.LogOpenOutcome.OPENED:
+        # If the open was for a FILE and the file actually existed,
+        # the location status is READY. The caller distinguishes via
+        # the result.location, but in practice callers of the file
+        # helper pass LogLocationStatus.READY here because the helper
+        # refuses to OPENED when the file is missing - so this branch
+        # is fine for both.
         note = ""
         if result.location.status is logging_setup.LogLocationStatus.FILE_MISSING:
             note = "（该目录存在，但 app.log 尚不存在——桥接可能还没有运行过一次，这不是错误。）"
@@ -421,7 +435,15 @@ def describe_log_open_result(result: logging_setup.LogOpenResult) -> str:
             f"日志目录尚不存在：{result.location.directory}。这通常表示桥接程序在这台"
             "电脑上还没有运行过；本程序不会为了显示而伪造日志。"
         )
-    return f"无法打开日志目录（{result.error}）：{result.location.directory}"
+    if result.outcome is logging_setup.LogOpenOutcome.FILE_MISSING:
+        # Distinct message from DIRECTORY_MISSING so the user knows the
+        # difference between "this app has never been run on this PC"
+        # and "the app has run, but hasn't written any log line yet".
+        return (
+            f"日志文件尚未生成：{result.location.file_path}。"
+            "桥接程序还没写过日志（这在刚安装完、还没按下任何按钮时是正常的）。"
+        )
+    return f"无法打开日志（{result.error}）：{result.location.file_path}"
 
 
 def main() -> None:

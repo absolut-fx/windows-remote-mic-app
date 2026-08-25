@@ -150,6 +150,70 @@ Item {
                 }
             }
 
+            // -- Bridge auto-start (headless ``--bridge`` on login) ---------
+            // Sibling rectangle to the autostart toggle above. The two
+            // toggles are independent on disk - one writes
+            // ``RemoteMicRC003.lnk`` (settings window), the other writes
+            // ``RemoteMicRC003-Bridge.lnk`` (this one). Same Switch
+            // binding pattern, same ``when: !pressed`` loop guard.
+            Rectangle {
+                Layout.fillWidth: true
+                radius: tokens.cornerRadiusLarge
+                color: tokens.surface
+                border.color: tokens.border
+                border.width: 1
+                implicitHeight: bridgeAutostartColumn.implicitHeight + tokens.spacingLarge * 2
+
+                ColumnLayout {
+                    id: bridgeAutostartColumn
+                    anchors.fill: parent
+                    anchors.margins: tokens.spacingLarge
+                    spacing: tokens.spacingSmall
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label {
+                            text: qsTr("登录后后台运行调度桥")
+                            font.pixelSize: tokens.fontSizeTitle
+                            font.bold: true
+                            color: tokens.textPrimary
+                            Layout.fillWidth: true
+                        }
+                        Switch {
+                            id: bridgeAutostartSwitch
+                            objectName: "bridgeAutoStartSwitch"
+                            text: ""
+                            checked: SettingsController.bridgeAutoStart
+                            onCheckedChanged: {
+                                if (checked !== SettingsController.bridgeAutoStart
+                                        && !pressed) {
+                                    SettingsController.setBridgeAutoStart(checked)
+                                }
+                            }
+                            Accessible.name: qsTr("登录后后台运行调度桥")
+                        }
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: qsTr(
+                            "启用后将在当前用户的\"启动\"文件夹放置第二个快捷方式（RemoteMicRC003-Bridge.lnk），登录后无窗口运行调度桥服务。"
+                        )
+                        color: tokens.textSecondary
+                        font.pixelSize: tokens.fontSizeSmall
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: SettingsController.bridgeAutoStartStatusText
+                        color: SettingsController.bridgeAutoStartStatusIsError
+                            ? tokens.errorColor
+                            : tokens.textSecondary
+                        font.pixelSize: tokens.fontSizeSmall
+                    }
+                }
+            }
+
             // -- Closing-behavior summary ------------------------------------
             Rectangle {
                 Layout.fillWidth: true

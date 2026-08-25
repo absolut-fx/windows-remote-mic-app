@@ -104,6 +104,7 @@ def describe_log_location(root: Optional[Path] = None) -> LogLocation:
 class LogOpenOutcome(Enum):
     OPENED = "opened"
     DIRECTORY_MISSING = "directory_missing"
+    FILE_MISSING = "file_missing"
     OPEN_FAILED = "open_failed"
 
 
@@ -122,6 +123,21 @@ def _default_open_directory(directory: Path) -> None:
     if startfile is None:
         raise OSError("os.startfile is only available on Windows")
     startfile(str(directory))
+
+
+def _default_open_file(file_path: Path) -> None:
+    """Open a SINGLE file in the OS default application.
+
+    Mirrors ``_default_open_directory`` byte-for-byte but targets the
+    file directly instead of its containing directory. ``os.startfile``
+    on Windows follows the registered handler for the file's
+    extension - ``.log`` is normally bound to Notepad, which is the
+    one-step "show me the log" UX the user asked for.
+    """
+    startfile = getattr(os, "startfile", None)
+    if startfile is None:
+        raise OSError("os.startfile is only available on Windows")
+    startfile(str(file_path))
 
 
 def open_log_location(
@@ -143,6 +159,47 @@ def open_log_location(
         return LogOpenResult(LogOpenOutcome.DIRECTORY_MISSING, location)
     try:
         _open_directory(location.directory)
+    except Exception as exc:  # noqa: BLE001 - report, never crash the settings window
+        return LogOpenResult(LogOpenOutcome.OPEN_FAILED, location, error=str(exc))
+    return LogOpenResult(LogOpenOutcome.OPENED, location)
+
+
+def open_log_file(
+    root: Optional[Path] = None,
+    *,
+    _open_file: Callable[[Path], None] = _default_open_file,
+) -> LogOpenResult:
+    """Opens the ``app.log`` file directly in the OS default application.
+
+    Sibling of ``open_log_location`` for the one-step View-log UX the
+    user asked for: click "查看日志" once, Notepad (or whatever the
+    user's registered ``.log`` handler is) pops up with the live
+    log file - no need to first open the directory, then double-click
+    the file, then wait.
+
+    Difference vs. ``open_log_location``:
+        - Targets the file, not the directory.
+        - Returns ``FILE_MISSING`` (not ``OPENED``) when the file
+          itself does not exist yet - the user has not run the bridge
+          since the last reinstall, and we MUST NOT silently open
+          the directory instead, because the contract for the new
+          button is "I want to see the log, not a folder picker".
+        - Returns ``OPENED`` only when the open call actually ran
+          against an existing ``app.log``.
+
+    Errors are caught and reported via ``LogOpenResult`` so the
+    Qt button handler that calls this stays crash-free.
+    """
+
+    location = describe_log_location(root)
+    if location.status is LogLocationStatus.DIRECTORY_MISSING:
+        return LogOpenResult(LogOpenOutcome.DIRECTORY_MISSING, location)
+    if location.status is LogLocationStatus.FILE_MISSING:
+        # Do NOT fall back to opening the directory: that would lie
+        # to the user about what just happened. Be honest instead.
+        return LogOpenResult(LogOpenOutcome.FILE_MISSING, location)
+    try:
+        _open_file(location.file_path)
     except Exception as exc:  # noqa: BLE001 - report, never crash the settings window
         return LogOpenResult(LogOpenOutcome.OPEN_FAILED, location, error=str(exc))
     return LogOpenResult(LogOpenOutcome.OPENED, location)

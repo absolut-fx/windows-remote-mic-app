@@ -177,6 +177,54 @@ def _run_bridge() -> None:
         raise SystemExit(single_instance.CLEANUP_FAILED_EXIT_CODE)
 
 
+def _run_settings_window() -> None:
+    """Default / --settings path: open the settings window under the
+    settings-mode single-instance mutex.
+
+    Mirrors ``_run_bridge``'s guard-fail-closed contract (XRBM-021 review
+    round 1 P1 #1) applied to a different named mutex:
+    ``Local\\RemoteMicRC003_SettingsInstance`` (independent from the
+    bridge mutex, so a settings window and a headless bridge can coexist
+    - they are different modes of the same .exe). A second concurrent
+    launch that targets the settings window must show a visible notice
+    and exit nonzero WITHOUT raising the QML settings UI twice - the
+    guard's ``__enter__`` raises ``DuplicateInstanceError`` before
+    ``settings_ui.main()`` is ever called, exactly as the bridge path
+    raises before ``app.main()`` is called. Same exit codes as the bridge
+    path so any external watcher (``tasklist``, the project CLI, etc.)
+    only needs one set of code-to-cause mappings.
+    """
+
+    from . import settings_ui, single_instance
+
+    try:
+        with single_instance.SettingsInstanceGuard():
+            settings_ui.main()
+    except single_instance.DuplicateInstanceError as exc:
+        single_instance.show_bridge_startup_blocked_notice(str(exc))
+        raise SystemExit(single_instance.DUPLICATE_INSTANCE_EXIT_CODE)
+    except single_instance.SingleInstanceUnavailableError as exc:
+        single_instance.show_bridge_startup_blocked_notice(
+            "Remote Mic · RC003 settings window could not verify no "
+            f"other instance is already running, so it will not open. ({exc})"
+        )
+        raise SystemExit(single_instance.GUARD_UNAVAILABLE_EXIT_CODE)
+    except single_instance.MutexCleanupError as exc:
+        # Diagnostic detail (fixed operation names/error codes only, per
+        # single_instance.py's "no raw handle" contract) goes to stderr
+        # for anyone who can see it; the user-visible notice stays a
+        # fixed, sanitized sentence regardless of the exact underlying
+        # failure.
+        print(f"settings single-instance mutex cleanup failed: {exc}", file=sys.stderr)
+        single_instance.show_bridge_startup_blocked_notice(
+            "Remote Mic · RC003 settings window closed, but could not "
+            "fully release its single-instance lock. If it will not open "
+            "again, check Task Manager for a lingering process before "
+            "retrying."
+        )
+        raise SystemExit(single_instance.CLEANUP_FAILED_EXIT_CODE)
+
+
 def main() -> None:
     args = sys.argv[1:]
     if "--help" in args or "-h" in args:
@@ -214,10 +262,10 @@ def main() -> None:
 
     # Default (no arguments) and explicit --settings both open the settings
     # window. A user who double-clicks the packaged exe must see a window,
-    # never a headless bridge process with no UI.
-    from . import settings_ui
-
-    settings_ui.main()
+    # never a headless bridge process with no UI. The window itself is
+    # guarded so a second concurrent launch exits cleanly instead of
+    # opening a duplicate settings window.
+    _run_settings_window()
 
 
 if __name__ == "__main__":

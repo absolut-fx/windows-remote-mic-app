@@ -289,7 +289,7 @@ Item {
                     Label {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
-                        text: qsTr("DJI Mic 2 是系统麦克风，不使用 RC003 的 CABLE Input 输出或 ATVV 桥。Remote Mic 不会静默修改 Windows 默认输入设备。")
+                        text: qsTr("DJI Mic 2 is the system microphone. It does NOT use the RC003 CABLE Input or ATVV bridge. Remote Mic never silently changes the Windows default input device.")
                         color: tokens.textSecondary
                         font.pixelSize: tokens.fontSizeSmall
                     }
