@@ -153,11 +153,19 @@ class TvNativeKeycodeTests(unittest.TestCase):
         # The PS/2 Set 1 make-code for "1" on a US keyboard is 0x02.
         self.assertEqual(scan, 0x02)
 
-    def test_tap_usage_to_button_mirror_tv_to_button_name(self):
-        # TAP_USAGE_TO_BUTTON is built from BUTTON_USAGE_IDS at import time,
-        # so the 0x0031 -> "tv" mapping must propagate.
+    def test_tap_usage_to_button_scoped_to_consumer_page_only(self):
+        # TAP_USAGE_TO_BUTTON is intentionally scoped to ONLY the three
+        # consumer-page usages (Vol+/Vol-/Back) that the LL hook cannot see.
+        # Other RC003 keyboard usages (tv, ok, mic, ...) are dispatched by
+        # the LL hook + Raw Input path; including them here would either
+        # double-dispatch or silently silence keys when Frida is offline.
         from ovb_rc003.frida_compat import TAP_USAGE_TO_BUTTON
-        self.assertEqual(TAP_USAGE_TO_BUTTON.get(0x0031), "tv")
+        # Must contain the three consumer-page keys.
+        self.assertEqual(TAP_USAGE_TO_BUTTON.get(0x0080), "volume_up")
+        self.assertEqual(TAP_USAGE_TO_BUTTON.get(0x0081), "volume_down")
+        self.assertEqual(TAP_USAGE_TO_BUTTON.get(0x00F1), "back")
+        # Must NOT contain tv (0x0031) - LL hook handles it.
+        self.assertIsNone(TAP_USAGE_TO_BUTTON.get(0x0031))
 
 
 if __name__ == "__main__":
