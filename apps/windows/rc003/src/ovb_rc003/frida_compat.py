@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,8 +25,21 @@ import time
 from typing import Callable
 
 from . import frida_hid_tap_runtime
-from .device_profile import BUTTON_USAGE_IDS
 from .frida_hid_tap_injector import inject_current_process
+
+
+_logger = logging.getLogger(__name__)
+
+# Diagnostic gate.  Set OVB_DISABLE_FRIDA_TAP=1 in the environment to skip the
+# Frida HID-over-GATT retry loop entirely.  Intended for verifying that the
+# Raw Input path delivers RC003 reports without interference from the Frida
+# injector (which currently fails OpenProcess on wudfhost.exe with
+# WinError 5 and floods the log every retry delay).
+_DISABLE_FRIDA_TAP_ENV = "OVB_DISABLE_FRIDA_TAP"
+
+
+def _frida_tap_disabled_by_env() -> bool:
+    return os.environ.get(_DISABLE_FRIDA_TAP_ENV) == "1"
 
 
 @dataclass(frozen=True)
@@ -59,15 +73,13 @@ MISSING_USAGE_TO_BUTTON = {
     VOLUME_DOWN_USAGE: "volume_down",
 }
 
-# The tap observes the full 6-byte keyboard report (three little-endian 16-bit
-# usages), not just the three usages Windows' keyboard class drops.  Reporting
-# every known RC003 keyboard usage lets the application arm its duplicate
-# suppressor from the tap's socket thread - a side channel the low-level hook
-# does not block, unlike the WM_INPUT arm that arrives too late (measured
-# ~63-72ms after the hook on the RC003).
+# Scope the Frida TAP dispatch to ONLY the three consumer-page usages the
+# low-level keyboard hook can't see (Vol+/Vol-/Back).  The other RC003
+# keyboard usages are already handled correctly by the LL hook + Raw Input
+# path; including them here would either double-dispatch (when the LL hook's
+# arm descriptor doesn't match) or silently silence keys when the Frida
+# socket thread is offline.
 TAP_USAGE_TO_BUTTON = dict(MISSING_USAGE_TO_BUTTON)
-for _usage, _button in BUTTON_USAGE_IDS.items():
-    TAP_USAGE_TO_BUTTON.setdefault(_usage, _button)
 
 # usage -> (VK, make code, extended) matching what Windows' keyboard class
 # reports for the same physical key, so the hook's consume() sees identical
@@ -135,6 +147,7 @@ class RC003HidReportTap:
         self.report_handler = report_handler
         self.archive_path = archive_path or gadget_archive_path()
         self.enabled = bool(enabled) and os.name == "nt"
+        self.disabled_by_env = _frida_tap_disabled_by_env()
         self.retry_delay = max(0.5, float(retry_delay))
         self.heartbeat_timeout = max(10.0, float(heartbeat_timeout))
         self.stop_event = threading.Event()
@@ -153,6 +166,8 @@ class RC003HidReportTap:
 
     @property
     def status(self) -> str:
+        if self.disabled_by_env:
+            return "disabled_by_env_OVB_DISABLE_FRIDA_TAP"
         if not self.enabled:
             return "disabled_non_windows"
         if not self.archive_path.is_file():
@@ -192,12 +207,14 @@ class RC003HidReportTap:
         changes.extend(
             f"{TAP_USAGE_TO_BUTTON[value]}=up" for value in sorted(released)
         )
-        print(
-            f"RC003 HID TAP {' '.join(changes)} raw={data.hex()}",
-            flush=True,
-        )
+        _logger.info("RC003 HID TAP %s raw=%s", " ".join(changes), data.hex())
 
     def _run(self) -> None:
+        if self.disabled_by_env:
+            _logger.info(
+                "RC003 HID TAP skipped reason=OVB_DISABLE_FRIDA_TAP=1"
+            )
+            return
         injection_attempted_pid: int | None = None
         while not self.stop_event.is_set():
             pid = frida_hid_tap_runtime.find_rc003_hidogatt_host_pid()
@@ -205,7 +222,7 @@ class RC003HidReportTap:
                 now = time.monotonic()
                 if now - self._last_wait_log >= 30.0:
                     self._last_wait_log = now
-                    print("RC003 HID TAP waiting_for_rc003_host", flush=True)
+                    _logger.info("RC003 HID TAP waiting_for_rc003_host")
                 self.stop_event.wait(self.retry_delay)
                 continue
             if pid != injection_attempted_pid:
@@ -222,9 +239,10 @@ class RC003HidReportTap:
                         inject_current_process(pid)
                         injection_attempted_pid = pid
                     except Exception as exc:
-                        print(
-                            f"RC003 HID TAP injection retry {type(exc).__name__}: {exc}",
-                            flush=True,
+                        _logger.warning(
+                            "RC003 HID TAP injection retry %s: %s",
+                            type(exc).__name__,
+                            exc,
                         )
                         self.stop_event.wait(self.retry_delay)
                         continue
@@ -234,9 +252,9 @@ class RC003HidReportTap:
                     continue
                 client.settimeout(1.0)
                 try:
-                    print(
-                        f"RC003 HID TAP ATTACHED pid={pid} awaiting_io=true",
-                        flush=True,
+                    _logger.info(
+                        "RC003 HID TAP ATTACHED pid=%d awaiting_io=true",
+                        pid,
                     )
                     buffer = b""
                     last_heartbeat = time.monotonic()
@@ -244,7 +262,7 @@ class RC003HidReportTap:
                     announced_ready = False
                     while not self.stop_event.is_set():
                         if frida_hid_tap_runtime.find_rc003_hidogatt_host_pid() != pid:
-                            print(f"RC003 HID TAP HOST CHANGED old_pid={pid}", flush=True)
+                            _logger.info("RC003 HID TAP HOST CHANGED old_pid=%d", pid)
                             injection_attempted_pid = None
                             break
                         try:
@@ -274,23 +292,22 @@ class RC003HidReportTap:
                                         io_verified = True
                                         self._handle_ioctl_output(data)
                                 elif kind == "error":
-                                    print(
-                                        f"RC003 HID TAP hook_error={message.get('message')}",
-                                        flush=True,
+                                    _logger.warning(
+                                        "RC003 HID TAP hook_error=%s",
+                                        message.get("message"),
                                     )
                         now = time.monotonic()
                         if now - last_heartbeat >= self.heartbeat_timeout:
-                            print(
-                                f"RC003 HID TAP UNHEALTHY pid={pid} "
-                                "reason=agent_heartbeat_stale",
-                                flush=True,
+                            _logger.warning(
+                                "RC003 HID TAP UNHEALTHY pid=%d reason=agent_heartbeat_stale",
+                                pid,
                             )
                             break
                         if io_verified and not announced_ready:
                             announced_ready = True
-                            print(
-                                f"RC003 HID TAP READY pid={pid} io_verified=true",
-                                flush=True,
+                            _logger.info(
+                                "RC003 HID TAP READY pid=%d io_verified=true",
+                                pid,
                             )
                 finally:
                     try:
@@ -304,11 +321,16 @@ class RC003HidReportTap:
                 self.stop_event.wait(0.5)
 
     def start(self) -> bool:
+        if self.disabled_by_env:
+            _logger.info(
+                "RC003 HID TAP not starting reason=OVB_DISABLE_FRIDA_TAP=1"
+            )
+            return False
         if not self.enabled:
-            print("RC003 HID TAP disabled", flush=True)
+            _logger.info("RC003 HID TAP disabled")
             return False
         if not self.dependency_available:
-            print("RC003 HID TAP unavailable verified_gadget_not_installed", flush=True)
+            _logger.warning("RC003 HID TAP unavailable verified_gadget_not_installed")
             return False
         if self.thread is not None and self.thread.is_alive():
             return True
