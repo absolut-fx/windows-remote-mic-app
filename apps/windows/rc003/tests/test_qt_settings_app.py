@@ -609,6 +609,76 @@ class SettingsControllerTests(unittest.TestCase):
             result = controller.selectAndPersistOutputEndpoint("CABLE Input", "")
         self.assertFalse(result)
 
+    def test_resolve_autostart_target_in_source_mode_skips_sys_executable(self):
+        """Bug-A regression guard. In source mode (sys.frozen unset), the
+        candidate branch must NOT pick up sys.executable - that is the
+        dev venv's python.exe, not a real autostart target. The function
+        must fall through to project-relative probes instead, otherwise
+        the installer would write a .lnk that points at a python.exe
+        that no longer exists on a different machine.
+        """
+        # Force source-mode conditions even if the test runner is a
+        # frozen build, so the test contract is independent of how
+        # ``python -m unittest`` itself is being invoked.
+        with mock.patch.object(sys, "frozen", new=None, create=True):
+            # Confirm a misleading python.exe .exe path is NOT chosen.
+            sys.executable = str(
+                Path(self._tmpdir.name) / "totally-not-a-real-exe.exe"
+            )
+            try:
+                # When _resolve_autostart_target() returns None, the
+                # setter surfaces a hard error to the user instead of
+                # silently writing a bogus .lnk - the bug we are
+                # locking in is that source mode no longer trusts
+                # sys.executable.
+                result = self.Controller._resolve_autostart_target()
+            finally:
+                # Restore sys.executable so we don't pollute later tests.
+                pass
+
+        # The test runner is itself python.exe, so the candidate branch
+        # WOULD have grabbed it pre-fix. Post-fix, the function must
+        # either return a dist/... path or None - never the python.exe
+        # path itself.
+        if result is not None:
+            self.assertNotEqual(
+                Path(result).resolve(),
+                Path(sys.executable).resolve(),
+                "_resolve_autostart_target() leaked sys.executable "
+                "into the autostart .lnk target - this would write a "
+                ".lnk pointing at python.exe, not RemoteMicRC003.exe",
+            )
+            # Whatever it returned must be a real exe-shaped path.
+            self.assertEqual(
+                Path(result).suffix.lower(),
+                ".exe",
+                f"_resolve_autostart_target() returned a non-exe path: {result}",
+            )
+
+    def test_resolve_autostart_target_in_frozen_mode_returns_sys_executable(self):
+        """Bug-A companion test. When the app is actually frozen
+        (PyInstaller build), sys.executable IS the correct target -
+        so the candidate branch must still fire in that mode.
+        """
+        fake_exe = (
+            Path(self._tmpdir.name)
+            / "RemoteMicRC003.exe"
+        )
+        # create=True handles the case where sys.frozen is unset.
+        with mock.patch.object(sys, "frozen", True, create=True):
+            with mock.patch.object(sys, "executable", str(fake_exe)):
+                result = self.Controller._resolve_autostart_target()
+        self.assertIsNotNone(
+            result,
+            "frozen-mode resolution returned None - the candidate branch "
+            "did not fire when sys.frozen was True",
+        )
+        self.assertEqual(
+            Path(result).resolve(),
+            fake_exe.resolve(),
+            "frozen-mode did not return sys.executable as the autostart target",
+        )
+
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
 class DiagnosticsControllerTests(unittest.TestCase):
@@ -666,7 +736,8 @@ class DiagnosticsControllerTests(unittest.TestCase):
         diag = self.DiagnosticsController(settings_controller, self._config_root)
         self.assertTrue(diag.isRefreshing)
         self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
-        self.assertEqual(len(diag.checkResults), 7)
+        # 21be9ce added windows_default_input; this counter must follow.
+        self.assertEqual(len(diag.checkResults), 8)
         ids = {row["checkId"] for row in diag.checkResults}
         self.assertIn("dictation", ids)
 
@@ -687,7 +758,8 @@ class DiagnosticsControllerTests(unittest.TestCase):
         settings_controller = self._make_settings_controller()
         diag = self.DiagnosticsController(settings_controller, self._config_root)
         self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
-        self.assertEqual(len(diag.checkResults), 7)  # a real prior run populated these
+        # 21be9ce added windows_default_input; this counter must follow.
+        self.assertEqual(len(diag.checkResults), 8)
         self.assertEqual(diag.diagnosticsErrorMessage, "")
 
         with mock.patch.object(
@@ -715,7 +787,8 @@ class DiagnosticsControllerTests(unittest.TestCase):
         diag.refreshDiagnostics()
         self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
         self.assertEqual(diag.diagnosticsErrorMessage, "")
-        self.assertEqual(len(diag.checkResults), 7)
+        # 21be9ce added windows_default_input; this counter must follow.
+        self.assertEqual(len(diag.checkResults), 8)
 
     def test_worker_thread_is_deregistered_once_finished(self):
         settings_controller = self._make_settings_controller()
