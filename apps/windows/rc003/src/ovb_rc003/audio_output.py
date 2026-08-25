@@ -145,7 +145,12 @@ def _enumerate_endpoints(channel_count_key: str) -> List[AudioEndpoint]:
 # one endpoint the "select detected CABLE Input" action is allowed to persist.
 CABLE_INPUT_NAME = "CABLE Input"
 CABLE_OUTPUT_NAME = "CABLE Output"
-DJI_MIC_2_NAME_PREFIXES = ("DJI-MIC2", "DJI Mic 2", "DJI Mic2")
+# ``"Wireless Mic Rx"`` is the PnP/USB enumerator name PortAudio sees when the
+# DJI Mic 2 receiver is plugged in over its wireless USB dongle; the receiver
+# exposes three of these under different host APIs. Without this entry the
+# diagnostics page reports "no DJI Mic 2 endpoint" even when the receiver is
+# the device Windows actually selected as the default input.
+DJI_MIC_2_NAME_PREFIXES = ("DJI-MIC2", "DJI Mic 2", "DJI Mic2", "Wireless Mic Rx")
 
 
 def _matches_cable_endpoint(name: str, canonical: str) -> bool:
