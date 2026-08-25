@@ -1044,10 +1044,17 @@ def _load_qt_classes() -> dict:
             Startup folder. ``None`` means we cannot autostart from
             here (e.g. running tests or a misconfigured install).
             """
-            # Frozen build: sys.executable is the .exe itself.
-            candidate = Path(getattr(sys, "executable", "") or "")
-            if candidate and candidate.suffix.lower() == ".exe":
-                return candidate.resolve()
+            # Frozen build (PyInstaller sets ``sys.frozen``): the running
+            # ``sys.executable`` is the .exe itself and is the only
+            # correct autostart target. ``sys.executable`` only matches
+            # an installed .exe when ``sys.frozen`` is set, so we gate
+            # on that explicitly - source-mode runs resolve to
+            # ``python.exe``, which would point the Startup shortcut at
+            # the dev interpreter (wrong launcher).
+            if getattr(sys, "frozen", False):
+                candidate = Path(getattr(sys, "executable", "") or "")
+                if candidate and candidate.suffix.lower() == ".exe":
+                    return candidate.resolve()
             # Source-mode fallback: prefer the installed .exe in dist/
             # over the python interpreter, since the user probably
             # wants to autostart the app, not the dev launcher.

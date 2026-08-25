@@ -109,8 +109,23 @@ Item {
                             id: autostartSwitch
                             objectName: "startWithWindowsSwitch"
                             text: ""
+                            // Two-way binding: ``checked`` always tracks
+                            // SettingsController.startWithWindows, even
+                            // after the user clicks (a one-way binding
+                            // gets broken by the imperative assignment
+                            // that Switch performs on click). The
+                            // ``when: !pressed`` guard prevents feedback
+                            // loops while the user is dragging the
+                            // switch - we only re-push the property
+                            // back to the controller when the user is
+                            // not currently interacting with it.
                             checked: SettingsController.startWithWindows
-                            onToggled: SettingsController.setStartWithWindows(checked)
+                            onCheckedChanged: {
+                                if (checked !== SettingsController.startWithWindows
+                                        && !pressed) {
+                                    SettingsController.setStartWithWindows(checked)
+                                }
+                            }
                             Accessible.name: qsTr("开机时自动启动")
                         }
                     }
