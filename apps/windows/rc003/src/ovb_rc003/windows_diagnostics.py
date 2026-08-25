@@ -48,6 +48,7 @@ from . import audio_output
 from . import ble_transport_winrt
 from . import identity
 from . import raw_input_windows
+from . import windows_default_audio
 
 # Windows 10 version 1809's build number - the lowest build this project's
 # own README/installer already claim as the supported floor (see
@@ -1078,6 +1079,42 @@ def check_dji_mic_2_input(
     )
 
 
+def check_windows_default_input(
+    *,
+    query: Callable[[], Optional[str]] = windows_default_audio.query_default_capture_endpoint_name,
+) -> CheckResult:
+    """What Windows itself, not PortAudio, currently calls the default
+    capture (input) endpoint. Sits next to the ``dji_mic_2_input`` row so
+    the user can spot a ``PortAudio vs. Windows`` drift (e.g. when the user
+    changes the Windows default input and the PortAudio-side check still
+    reports the previous device). Read-only - never mutates the default.
+    """
+    if sys.platform != "win32":
+        return CheckResult(
+            "windows_default_input",
+            "Windows 当前默认录音设备",
+            CheckGroup.EXTERNAL_MICROPHONE,
+            CheckStatus.UNSUPPORTED,
+            "当前不是 Windows，无法读取系统默认录音端点。",
+        )
+    name = query()
+    if not name:
+        return CheckResult(
+            "windows_default_input",
+            "Windows 当前默认录音设备",
+            CheckGroup.EXTERNAL_MICROPHONE,
+            CheckStatus.UNSUPPORTED,
+            "无法读取 Windows 当前默认录音端点（COM 调用失败）；未修改 Windows 设置。",
+        )
+    return CheckResult(
+        "windows_default_input",
+        "Windows 当前默认录音设备",
+        CheckGroup.EXTERNAL_MICROPHONE,
+        CheckStatus.PASS,
+        f"Windows 当前默认录音端点：{name}；本程序不会修改此设置。",
+    )
+
+
 # -- Output endpoint resolution (voice bridge) ------------------------------
 
 
@@ -1251,6 +1288,12 @@ def run_diagnostics(
             "DJI Mic 2 录音输入",
             CheckGroup.EXTERNAL_MICROPHONE,
             check_dji_mic_2_input,
+        ),
+        (
+            "windows_default_input",
+            "Windows 当前默认录音设备",
+            CheckGroup.EXTERNAL_MICROPHONE,
+            check_windows_default_input,
         ),
         ("dictation", "Windows 听写 (Win+H)", CheckGroup.DICTATION, check_dictation_manual),
     )
