@@ -849,7 +849,6 @@ def _load_qt_classes() -> dict:
                 if self._tray_controller is None:
                     self._tray_controller = tray_icon.TrayController(
                         app_name="Remote Mic \u8bbe\u7f6e",
-                        is_shortcut_active_provider=startup_shortcut.is_enabled,
                     )
                     # Connect the menu signals to the controller
                     # slots. The lambdas re-read attributes at click
@@ -859,11 +858,6 @@ def _load_qt_classes() -> dict:
                     )
                     self._tray_controller.quit_requested.connect(
                         self._on_tray_quit
-                    )
-                    # Sync the "Open Startup folder" menu item's
-                    # enabled state with reality on every change.
-                    self._tray_controller.set_shortcut_active(
-                        self._start_with_windows
                     )
                 shown = self._tray_controller.show()
                 available = bool(shown)
