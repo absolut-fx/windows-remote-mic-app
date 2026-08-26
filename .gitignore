@@ -5,6 +5,15 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Editor / session scratch files - never track these. Created by editors
+# that auto-backup on save and by Hermes sessions that drop skill reads /
+# scratch files into the working tree.
+*.bak
+*.bak-*
+*.tmp
+__skill_read.tmp
+.hermes/
+
 # Local project-control records are not part of the public source release.
 docs/*
 !docs/screenshots/
