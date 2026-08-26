@@ -143,11 +143,25 @@ def _assets_directory() -> Path:
 
 
 def _tray_icon_path() -> Path:
-    """The canonical SVG asset path, regardless of frozen / unfrozen.
+    """The canonical tray icon asset path, regardless of frozen / unfrozen.
 
     Always returns a Path object - callers must check ``.exists()``.
+
+    Resolution order matches ``_load_tray_icon``: prefer SVG (vector,
+    scales cleanly to any DPI), fall back to PNG (raster, bundled as
+    the Windows .ico extraction of the source app icon when no SVG
+    has been authored yet). Both end up rendered by
+    ``_build_tray_icon`` at multiple pixel sizes for the tray.
     """
-    return _assets_directory() / "icons" / "app-tray.svg"
+    assets = _assets_directory() / "icons"
+    for name in ("app-tray.svg", "app-tray.png"):
+        candidate = assets / name
+        if candidate.exists():
+            return candidate
+    # Return the canonical SVG path even if absent so the caller's
+    # ``.exists()`` check produces a truthful ``missing: ..." log
+    # message naming the expected file.
+    return assets / "app-tray.svg"
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +201,36 @@ def _load_svg_icon(svg_path: Path, size: int = 64) -> Optional[QIcon]:
         return QIcon(pixmap)
     except Exception as exc:  # Qt raises a variety of exceptions here
         logger.warning("tray icon SVG render failed (%s): %s", exc, svg_path)
+        return None
+
+
+def _load_png_icon(png_path: Path, size: int = 64) -> Optional[QIcon]:
+    """Rasterize ``png_path`` to a QIcon of the given pixel size.
+
+    Used as a tier-2 fallback when no SVG has been authored for the
+    app. The PNG is expected to be 256x256 (the size Windows stores
+    in the app .ico); Qt's ``QPixmap.scaled`` keeps aspect ratio
+    while downsampling to the tray's 16/32/64/128 pixel targets.
+
+    Returns ``None`` on any failure - callers fall back to the
+    programmatic glyph.
+    """
+    if not png_path.exists():
+        logger.warning("tray icon PNG missing: %s", png_path)
+        return None
+    try:
+        source = QPixmap(str(png_path))
+        if source.isNull():
+            logger.warning("tray icon PNG failed to decode: %s", png_path)
+            return None
+        scaled = source.scaled(
+            size, size,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        return QIcon(scaled)
+    except Exception as exc:  # Qt raises a variety of exceptions here
+        logger.warning("tray icon PNG render failed (%s): %s", exc, png_path)
         return None
 
 
@@ -252,28 +296,36 @@ def _fallback_icon(size: int = 64) -> QIcon:
 
 
 def _build_tray_icon(svg_path: Path) -> QIcon:
-    """Try the SVG, fall back to the programmatic pixmap.
+    """Tier the icon loaders: SVG > PNG > programmatic glyph.
 
     Always returns a usable QIcon. Never raises. Rasterizes at
     several sizes so the system tray gets a crisp icon at any DPI
     (Windows requests 16x16 for the notification area, 32x32 for
     the expanded view, and may go higher for accessibility zoom);
     a single 64x64 rasterization blurs when scaled back up.
+
+    ``svg_path`` is the result of ``_tray_icon_path()`` - if the
+    path's suffix is ``.png`` we go straight to the PNG loader and
+    skip QSvg entirely (no point parsing a raster through an SVG
+    renderer). The SVG/PNG pick keeps the tray icon visually
+    consistent with the desktop shortcut and the EXE's embedded
+    .ico - all three use the same single source asset on disk.
     """
     icon = QIcon()
     loaded_any = False
+    loader = _load_png_icon if svg_path.suffix.lower() == ".png" else _load_svg_icon
     for size in (16, 32, 64, 128):
-        svg_icon = _load_svg_icon(svg_path, size=size)
-        if svg_icon is not None and not svg_icon.isNull():
+        loaded = loader(svg_path, size=size)
+        if loaded is not None and not loaded.isNull():
             # ``QIcon.addPixmap`` is the documented API for adding
             # per-size rasters. ``QIcon::Mode::Normal`` is the only
             # mode used for the system tray; we don't bother with
             # disabled/selected/active variants.
-            icon.addPixmap(svg_icon.pixmap(size, size))
+            icon.addPixmap(loaded.pixmap(size, size))
             loaded_any = True
     if loaded_any and not icon.isNull():
         return icon
-    # SVG never produced a usable raster - fall back. Render the
+    # Source asset never produced a usable raster - fall back. Render the
     # fallback at multiple sizes too so each tray scale is crisp.
     fallback = QIcon()
     for size in (16, 32, 64, 128):
