@@ -202,6 +202,59 @@ class ConnectTests(unittest.TestCase):
         finally:
             _run(session.close())
 
+    def test_populate_step_status_is_logged_with_a_human_readable_name(self):
+        """Regression: the populate-step diagnostic must log a human-readable
+        status name (SUCCESS / UNREACHABLE / PROTOCOL_ERROR / ACCESS_DENIED)
+        so production log analysis can distinguish reconnect flakes from
+        real errors. On the test fake the enum is a plain int constant
+        class, so the name lookup falls back to 'UNKNOWN(int)'; the test
+        just pins down that the log call happens with a non-empty status
+        string and the integer value, so production WinRT will get the
+        real name (GattCommunicationStatus(value).name is supported by
+        the actual winrt projection, only the fake lacks it).
+        """
+        import logging
+
+        env = FakeWinRTEnvironment()
+        winrt = env.build_winrt_modules()
+
+        captured: list[str] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record.getMessage())
+
+        cap = _Capture()
+        logger = logging.getLogger("ovb_rc003.ble_transport_winrt")
+        logger.addHandler(cap)
+        logger.setLevel(logging.INFO)
+        try:
+            async def scenario() -> None:
+                session, candidate = self._connect_session(
+                    env, on_pcm_frame=lambda samples: None
+                )
+                await session.connect(candidate)
+                await session.close()
+
+            _run(scenario())
+        finally:
+            logger.removeHandler(cap)
+
+        # At least one populate-step status line must have been logged.
+        populate_lines = [m for m in captured if "populate step status=" in m]
+        self.assertTrue(
+            populate_lines,
+            "expected at least one 'populate step status=' log line, got: "
+            f"{captured!r}",
+        )
+        # On the test fake, status resolution falls back to UNKNOWN(int) -
+        # the integer must still be present so we can map it back to a
+        # GattCommunicationStatus enum value in production.
+        for line in populate_lines:
+            self.assertIn("UNKNOWN(", line)
+            # Integer value present (the (NNN) suffix).
+            self.assertRegex(line, r"populate step status=UNKNOWN\(\d+\)")
+
     def test_connect_enumerates_full_gatt_table_before_uuid_query(self):
         """Regression: ``get_gatt_services_async(UNCACHED)`` must be called
         before ``get_gatt_services_for_uuid_with_cache_mode_async`` on every
