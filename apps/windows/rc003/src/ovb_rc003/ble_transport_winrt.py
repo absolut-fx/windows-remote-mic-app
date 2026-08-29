@@ -330,15 +330,19 @@ class RC003BleSession:
             # UNCACHED on a freshly-paired-but-never-queried device is not
             # enough on its own: WinRT returns an empty result until the GATT
             # table has been enumerated at least once. Force a full enumeration
-            # first (also UNCACHED) so the subsequent UUID-filtered query can
-            # succeed reliably. Observed flakiness before this call was added:
-            # 8/9 connection attempts returned an empty services list and
-            # raised "ATVV voice service not found on this device" before a
-            # single retry succeeded - visible in the production app log on a
-            # device paired under the Chinese name "小米蓝牙语音遥控器".
-            populate_result = await self._device.get_gatt_services_async(
-                winrt.bluetooth_cache_mode.UNCACHED
-            )
+            # first so the subsequent UUID-filtered query can succeed reliably.
+            # Observed flakiness before this call was added: 8/9 connection
+            # attempts returned an empty services list and raised "ATVV voice
+            # service not found on this device" before a single retry
+            # succeeded - visible in the production app log on a device paired
+            # under the Chinese name "小米蓝牙语音遥控器".
+            #
+            # ``BluetoothLEDevice.get_gatt_services_async()`` takes no
+            # arguments on real WinRT (the cache mode belongs only on the
+            # ``*_with_cache_mode_async`` overloads); an earlier revision
+            # passed UNCACHED here, which the live WinRT projection rejects
+            # with "Invalid parameter count" on every connect attempt.
+            populate_result = await self._device.get_gatt_services_async()
             if populate_result.status != winrt.gatt_communication_status.SUCCESS:
                 raise ConnectionError(
                     f"could not enumerate GATT services: {populate_result.status}"

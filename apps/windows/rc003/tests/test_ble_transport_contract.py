@@ -271,9 +271,9 @@ class ConnectTests(unittest.TestCase):
 
         original = device.get_gatt_services_async
 
-        async def failing_enumeration(cache_mode):
+        async def failing_enumeration():
             self.assertEqual(len(device.gatt_services_call_count), 0)
-            original_result = await original(cache_mode)
+            original_result = await original()
             return FakeGattServicesResult(
                 FakeGattCommunicationStatus.UNREACHABLE, original_result.services
             )

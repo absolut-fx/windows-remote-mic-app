@@ -239,15 +239,19 @@ class FakeBluetoothLEDevice:
         )
         return FakeGattServicesResult(FakeGattCommunicationStatus.SUCCESS, [self._service])
 
-    async def get_gatt_services_async(self, cache_mode) -> FakeGattServicesResult:
+    async def get_gatt_services_async(self) -> FakeGattServicesResult:
         """Full GATT service enumeration (no UUID filter). Production code
-        calls this with UNCACHED on connect() so the per-device GATT cache
-        is populated before the subsequent UUID-filtered lookup is made
-        (the WinRT quirk being fixed: on a freshly-paired-but-never-queried
-        device, the UUID-filtered call returns empty until enumeration has
-        happened at least once). The fake returns the configured service
-        list unconditionally, mirroring the success path - tests that need
-        to exercise the empty/non-SUCCESS path inject their own fake.
+        calls this on connect() so the per-device GATT cache is populated
+        before the subsequent UUID-filtered lookup is made (the WinRT quirk
+        being fixed: on a freshly-paired-but-never-queried device, the
+        UUID-filtered call returns empty until enumeration has happened at
+        least once). The fake takes no arguments, mirroring the live WinRT
+        ``BluetoothLEDevice.get_gatt_services_async()`` signature - earlier
+        revisions accepted a ``cache_mode`` parameter that the real WinRT
+        projection rejects with "Invalid parameter count". The fake returns
+        the configured service list unconditionally, mirroring the success
+        path - tests that need to exercise the empty/non-SUCCESS path
+        inject their own fake.
 
         Also tracks the call ordering on the device so a regression test
         can assert the full enumeration happened before any UUID-filtered
