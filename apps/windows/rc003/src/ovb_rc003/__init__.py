@@ -7,4 +7,4 @@ unverified on real hardware.
 
 __all__ = ["__version__"]
 
-__version__ = "0.1.1-elevated-autostart-2026-08-26"
+__version__ = "0.1.0-candidate"
