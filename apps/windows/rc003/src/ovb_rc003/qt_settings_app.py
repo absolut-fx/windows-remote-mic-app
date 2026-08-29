@@ -97,19 +97,16 @@ from __future__ import annotations
 import atexit
 import gc
 import logging
-import subprocess
 import sys
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from . import (
-    __version__ as ovb_version,
     audio_output,
     bridge_launcher,
     config,
     device_catalog,
-    elevated_autostart,
     hotkey,
     hotkey_capture_windows,
     key_mapping,
@@ -730,10 +727,6 @@ def _load_qt_classes() -> dict:
         startWithWindowsChanged = Signal()
         startWithWindowsStatusTextChanged = Signal()
         startWithWindowsStatusIsErrorChanged = Signal()
-        elevatedAutostartChanged = Signal()
-        elevatedAutostartRegisteredChanged = Signal()
-        elevatedAutostartStatusTextChanged = Signal()
-        elevatedAutostartStatusIsErrorChanged = Signal()
         closingBehaviorTextChanged = Signal()
 
         _TRIGGER_MODE_ORDER = tuple(key_mapping.VoiceTriggerMode)
@@ -797,19 +790,6 @@ def _load_qt_classes() -> dict:
             )
             self._start_with_windows_status_text: str = ""
             self._start_with_windows_status_is_error: bool = False
-            # elevated-on-logon autostart state. The task lives in the
-            # Windows Task Scheduler (registered once via
-            # register-rmic-autostart.ps1, owned by the user). Until the
-            # registration script is run, ``_elevated_autostart_registered``
-            # is False and the toggle shows a hint pointing at the script.
-            self._elevated_autostart: bool = (
-                elevated_autostart.is_enabled()
-            )
-            self._elevated_autostart_registered: bool = (
-                elevated_autostart.is_registered()
-            )
-            self._elevated_autostart_status_text: str = ""
-            self._elevated_autostart_status_is_error: bool = False
 
             self._endpoint_options: List[str] = []
             self._selected_endpoint_index = -1
@@ -854,7 +834,6 @@ def _load_qt_classes() -> dict:
             self._apply_tray_to_runtime()
             self.install_window_event_filter(window)
             self._refresh_start_with_windows_status()
-            self._refresh_elevated_autostart_status()
             self._runtime_applied = True
 
         def _apply_tray_to_runtime(self) -> None:
@@ -1090,100 +1069,6 @@ def _load_qt_classes() -> dict:
         def _get_start_with_windows_status_is_error(self) -> bool:
             return self._start_with_windows_status_is_error
 
-        # -- elevated-on-logon autostart ------------------------------------
-
-        def _get_elevated_autostart(self) -> bool:
-            return self._elevated_autostart
-
-        def _set_elevated_autostart(self, value: bool) -> None:
-            """Toggle the Scheduled Task that launches both exes at logon
-            with an Administrators token (so Frida TAP can inject
-            WUDFHost.exe). Requires elevation to actually change the
-            task - we shell out to an elevated PowerShell via
-            ``ShellExecuteEx`` with ``runas`` so Windows handles the
-            UAC prompt (no prompt if UAC is disabled). The runner itself
-            is invoked synchronously on this thread because the QML
-            Switch's onCheckedChanged runs on the GUI thread; the
-            call is fast (< 1 s typical, 15 s timeout in
-            ``elevated_autostart.py``).
-            """
-            target = bool(value)
-            if target == self._elevated_autostart and target == bool(
-                elevated_autostart.is_enabled()
-            ):
-                return
-            try:
-                if target:
-                    result = elevated_autostart.enable()
-                else:
-                    result = elevated_autostart.disable()
-            except Exception as exc:  # noqa: BLE001
-                self._elevated_autostart_status_text = (
-                    f"\u542f\u52a8\u9879\u51fa\u9519: {exc}"
-                )
-                self._elevated_autostart_status_is_error = True
-                self.elevatedAutostartStatusTextChanged.emit()
-                self.elevatedAutostartStatusIsErrorChanged.emit()
-                return
-            self._elevated_autostart_status_text = result.message
-            self._elevated_autostart_status_is_error = (
-                result.outcome
-                == elevated_autostart.ElevatedAutostartOutcome.FAILED
-            )
-            self.elevatedAutostartStatusTextChanged.emit()
-            self.elevatedAutostartStatusIsErrorChanged.emit()
-            self._refresh_elevated_autostart_status()
-
-        def _get_elevated_autostart_registered(self) -> bool:
-            """True iff the Scheduled Task exists in Task Scheduler at
-            all. False means ``register-rmic-autostart.ps1`` has not
-            been run yet; the toggle UI shows a hint in that case.
-            """
-            return self._elevated_autostart_registered
-
-        def _get_elevated_autostart_status_text(self) -> str:
-            return self._elevated_autostart_status_text
-
-        def _get_elevated_autostart_status_is_error(self) -> bool:
-            return self._elevated_autostart_status_is_error
-
-        def _refresh_elevated_autostart_status(self) -> None:
-            """Re-query the Scheduled Task state from Windows and update
-            the bound status text. Cheap, safe to call any time.
-            """
-            new_registered = elevated_autostart.is_registered()
-            new_enabled = (
-                elevated_autostart.is_enabled() if new_registered else False
-            )
-            reg_changed = new_registered != self._elevated_autostart_registered
-            en_changed = new_enabled != self._elevated_autostart
-            self._elevated_autostart = new_enabled
-            self._elevated_autostart_registered = new_registered
-            if not new_registered:
-                self._elevated_autostart_status_text = (
-                    "\u672a\u6ce8\u518c\u8c03\u5ea6\u4efb\u52a1\u3002\u8bf7\u4ee5\u7ba1\u7406\u5458"
-                    "\u8eab\u4efd\u8fd0\u884c register-rmic-autostart.ps1\uff0c\u7136\u540e\u91cd\u542f"
-                    "\u8bbe\u7f6e\u7a97\u53e3\u6216\u70b9\u51fb\u4e0b\u65b9\u201c\u91cd\u65b0\u68c0\u6d4b\u201d\u3002"
-                )
-                self._elevated_autostart_status_is_error = True
-            elif new_enabled:
-                self._elevated_autostart_status_text = (
-                    "\u5df2\u542f\u7528\u3002\u4e0b\u6b21\u767b\u5f55\u4f1a\u4ee5\u7ba1\u7406\u5458\u8eab\u4efd"
-                    "\u542f\u52a8\u8bbe\u7f6e\u7a97\u53e3\u548c\u8c03\u5ea6\u6865\u3002"
-                )
-                self._elevated_autostart_status_is_error = False
-            else:
-                self._elevated_autostart_status_text = (
-                    "\u5df2\u7981\u7528\u3002\u4e0b\u6b21\u767b\u5f55\u4e0d\u4f1a\u81ea\u52a8\u542f\u52a8\u3002"
-                )
-                self._elevated_autostart_status_is_error = False
-            if reg_changed:
-                self.elevatedAutostartRegisteredChanged.emit()
-            if en_changed:
-                self.elevatedAutostartChanged.emit()
-            self.elevatedAutostartStatusTextChanged.emit()
-            self.elevatedAutostartStatusIsErrorChanged.emit()
-
         def _get_closing_behavior_text(self) -> str:
             if self._tray_enabled and self._tray_available:
                 return (
@@ -1197,13 +1082,6 @@ def _load_qt_classes() -> dict:
                 "\u5173\u95ed\u4f1a\u9690\u85cf\u5230\u6258\u76d8\u3002"
             )
 
-        def _get_version(self) -> str:
-            # Returned as a constant QML Property; rendered in main.qml
-            # window chrome so the user can confirm at a glance which
-            # build is currently running. Bumped in
-            # src/ovb_rc003/__init__.py.
-            return ovb_version
-
         @Slot()
         def setTrayEnabled(self, value: bool) -> None:  # noqa: N802 (QML slot)
             self._set_tray_enabled(value)
@@ -1213,22 +1091,10 @@ def _load_qt_classes() -> dict:
             self._set_start_with_windows(value)
 
         @Slot()
-        def setElevatedAutostart(self, value: bool) -> None:  # noqa: N802
-            self._set_elevated_autostart(value)
-
-        @Slot()
         def refreshStartWithWindowsStatus(self) -> None:  # noqa: N802
             """QML can call this on window show to re-read the on-disk
             state in case the shortcut was removed out-of-band."""
             self._refresh_start_with_windows_status()
-
-        @Slot()
-        def refreshElevatedAutostartStatus(self) -> None:  # noqa: N802
-            """QML re-read button: refresh the Scheduled Task state in
-            case the user just ran register-rmic-autostart.ps1 from
-            another shell and wants the toggle to flip without
-            restarting the settings window."""
-            self._refresh_elevated_autostart_status()
 
         def _save_config(self) -> None:
             config.save_config(config.config_path(self._config_root), self._config)
@@ -1256,35 +1122,9 @@ def _load_qt_classes() -> dict:
             _get_start_with_windows_status_is_error,
             notify=startWithWindowsStatusIsErrorChanged,
         )
-        elevatedAutostart = Property(
-            bool,
-            _get_elevated_autostart,
-            _set_elevated_autostart,
-            notify=elevatedAutostartChanged,
-        )
-        elevatedAutostartRegistered = Property(
-            bool,
-            _get_elevated_autostart_registered,
-            notify=elevatedAutostartRegisteredChanged,
-        )
-        elevatedAutostartStatusText = Property(
-            str,
-            _get_elevated_autostart_status_text,
-            notify=elevatedAutostartStatusTextChanged,
-        )
-        elevatedAutostartStatusIsError = Property(
-            bool,
-            _get_elevated_autostart_status_is_error,
-            notify=elevatedAutostartStatusIsErrorChanged,
-        )
         closingBehaviorText = Property(
             str, _get_closing_behavior_text, notify=closingBehaviorTextChanged
         )
-        # Bump this string in src/ovb_rc003/__init__.py - main.qml reads
-        # ``SettingsController.version`` and shows it as a label in the
-        # window chrome so the user can confirm at a glance which build is
-        # currently running. constant=True so QML never needs to re-bind.
-        version = Property(str, _get_version, constant=True)
 
         # -- internal helpers -------------------------------------------------
 
