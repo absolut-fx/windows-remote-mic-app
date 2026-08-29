@@ -835,6 +835,33 @@ def _load_qt_classes() -> dict:
             self.install_window_event_filter(window)
             self._refresh_start_with_windows_status()
             self._runtime_applied = True
+            # Auto-start the bridge so the app ships as a single-process
+            # unit: opening the settings window also brings up the BLE /
+            # HID / ATVV voice pipeline. The user no longer needs to
+            # click "保存并启动桥接" to hear voice; that button now serves
+            # only as a "restart bridge" lever after settings changes.
+            self._auto_launch_bridge()
+
+        def _auto_launch_bridge(self) -> None:
+            """Start the bridge in-process without requiring a save click.
+
+            Mirrors ``saveAndLaunch`` minus the ``_save()`` step: we use
+            whatever is currently on disk for the device profile / output
+            endpoint. DJI Mic 2 is excluded because it uses the Windows
+            default capture device and never needs the RC003 bridge.
+            """
+            if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
+                self._set_launch_status(
+                    "DJI Mic 2 使用 Windows 系统录音输入，不启动 RC003 BLE/HID/ATVV 桥。"
+                )
+                return
+            self._set_launch_status("正在启动…")
+            result = bridge_launcher.launch_bridge()
+            if result.handle is not None:
+                self._bridge_handle = result.handle
+                register_bridge_handle(result.handle)
+            self._set_launch_status(settings_ui.describe_launch_result(result))
+            self.bridgeRunningChanged.emit()
 
         def _apply_tray_to_runtime(self) -> None:
             """Show or hide the system tray icon according to
