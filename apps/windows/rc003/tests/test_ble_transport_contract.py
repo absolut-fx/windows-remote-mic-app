@@ -41,7 +41,12 @@ from ovb_rc003.ble_transport_winrt import (
     discover_candidates,
 )
 
-from .fakes.fake_winrt import FakeWinRTEnvironment, gatt_service_instance_id
+from .fakes.fake_winrt import (
+    FakeGattCommunicationStatus,
+    FakeGattServicesResult,
+    FakeWinRTEnvironment,
+    gatt_service_instance_id,
+)
 
 
 def _run(coro):
@@ -196,6 +201,95 @@ class ConnectTests(unittest.TestCase):
             self.assertEqual(len(env.device._connection_status_handlers), 1)
         finally:
             _run(session.close())
+
+    def test_connect_enumerates_full_gatt_table_before_uuid_query(self):
+        """Regression: ``get_gatt_services_async(UNCACHED)`` must be called
+        before ``get_gatt_services_for_uuid_with_cache_mode_async`` on every
+        connect(). On Windows the UUID-filtered lookup against a freshly-
+        paired-but-never-queried device returns an empty result until the
+        per-device GATT cache has been populated by a full enumeration - the
+        WinRT quirk that previously surfaced as 8/9 flaky "ATVV voice service
+        not found on this device" connect() failures followed by a single
+        successful retry, visible in the production app log when the remote
+        was paired under the Chinese name "小米蓝牙语音遥控器". Without the
+        full enumeration the UUID-filtered call is being asked against an
+        empty cache and has no way to succeed.
+
+        The retry that eventually succeeded in production was the
+        ``connection_supervisor`` retry loop coming back around to the next
+        ``connect()`` attempt, not anything inside ``connect()`` itself -
+        by which point the device's GATT table had already been enumerated
+        (by the previous failed attempt's UUID-filtered query, which the
+        real WinRT runtime uses to populate the cache even when it returns
+        empty). The structural fix here is to enumerate first, deterministically,
+        so the very first ``connect()`` can succeed instead of having to
+        rely on a stale-cache side-effect of a prior failed attempt.
+        """
+
+        env = FakeWinRTEnvironment()
+        winrt = env.build_winrt_modules()
+        device = env.device
+
+        async def scenario():
+            session, candidate = self._connect_session(
+                env, on_pcm_frame=lambda samples: None
+            )
+            await session.connect(candidate)
+            return session
+
+        session = _run(scenario())
+        try:
+            # Both calls must have been made, in the right order: full
+            # enumeration BEFORE the UUID-filtered lookup. The exact call
+            # counts are bookkeeping on the fake (see
+            # ``FakeBluetoothLEDevice.gatt_services_call_count`` /
+            # ``uuid_query_call_count``).
+            self.assertGreaterEqual(len(device.gatt_services_call_count), 1)
+            self.assertGreaterEqual(len(device.uuid_query_call_count), 1)
+            self.assertLess(
+                device.gatt_services_call_count[0],
+                device.uuid_query_call_count[0],
+                "full GATT enumeration must be invoked before the UUID-filtered "
+                "service lookup so the per-device cache is populated",
+            )
+        finally:
+            _run(session.close())
+
+    def test_full_gatt_enumeration_failure_is_surfaced_as_a_connection_error(self):
+        """Regression: a non-SUCCESS result from the full GATT enumeration
+        call (the populate-the-cache step) must surface as a ConnectionError
+        just like the existing UUID-filtered step does - never silently
+        succeed and never silently raise something else. Mirrors the
+        existing "ATVV voice service not found on this device" contract:
+        the supervisor's retry path is the place that decides what to do
+        next, not connect() itself.
+        """
+
+        env = FakeWinRTEnvironment()
+        winrt = env.build_winrt_modules()
+        device = env.device
+
+        original = device.get_gatt_services_async
+
+        async def failing_enumeration(cache_mode):
+            self.assertEqual(len(device.gatt_services_call_count), 0)
+            original_result = await original(cache_mode)
+            return FakeGattServicesResult(
+                FakeGattCommunicationStatus.UNREACHABLE, original_result.services
+            )
+
+        device.get_gatt_services_async = failing_enumeration
+
+        async def scenario():
+            session, candidate = self._connect_session(
+                env, on_pcm_frame=lambda samples: None
+            )
+            await session.connect(candidate)
+            return session
+
+        with self.assertRaises(ConnectionError) as ctx:
+            _run(scenario())
+        self.assertIn("could not enumerate GATT services", str(ctx.exception))
 
 
 class NotificationProcessingTests(unittest.TestCase):

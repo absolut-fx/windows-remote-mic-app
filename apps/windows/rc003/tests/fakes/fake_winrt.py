@@ -213,6 +213,13 @@ class FakeBluetoothLEDevice:
         self._connection_status_handlers: Dict[int, Any] = {}
         self._next_token = 1
         self.connection_status = FakeBluetoothConnectionStatus.CONNECTED
+        # Per-test call-order bookkeeping: bumped each time the production
+        # code calls get_gatt_services_async (full enumeration) /
+        # get_gatt_services_for_uuid_with_cache_mode_async (UUID-filtered)
+        # so a regression test can prove the full enumeration happened
+        # first. Reset by tests that want a clean ordering snapshot.
+        self.gatt_services_call_count: List[int] = []
+        self.uuid_query_call_count: List[int] = []
 
     def add_connection_status_changed(self, handler) -> int:
         token = self._next_token
@@ -232,9 +239,31 @@ class FakeBluetoothLEDevice:
         )
         return FakeGattServicesResult(FakeGattCommunicationStatus.SUCCESS, [self._service])
 
+    async def get_gatt_services_async(self, cache_mode) -> FakeGattServicesResult:
+        """Full GATT service enumeration (no UUID filter). Production code
+        calls this with UNCACHED on connect() so the per-device GATT cache
+        is populated before the subsequent UUID-filtered lookup is made
+        (the WinRT quirk being fixed: on a freshly-paired-but-never-queried
+        device, the UUID-filtered call returns empty until enumeration has
+        happened at least once). The fake returns the configured service
+        list unconditionally, mirroring the success path - tests that need
+        to exercise the empty/non-SUCCESS path inject their own fake.
+
+        Also tracks the call ordering on the device so a regression test
+        can assert the full enumeration happened before any UUID-filtered
+        query (see test_ble_transport_contract.py's
+        ``test_connect_enumerates_full_gatt_table_before_uuid_query``).
+        """
+
+        self.gatt_services_call_count.append(len(self.gatt_services_call_count) + len(self.uuid_query_call_count))
+        return FakeGattServicesResult(FakeGattCommunicationStatus.SUCCESS, [self._service])
+
     async def get_gatt_services_for_uuid_with_cache_mode_async(
         self, service_uuid: uuid.UUID, cache_mode
     ) -> FakeGattServicesResult:
+        self.uuid_query_call_count.append(
+            len(self.gatt_services_call_count) + len(self.uuid_query_call_count)
+        )
         return await self.get_gatt_services_for_uuid_async(service_uuid)
 
     def close(self) -> None:
