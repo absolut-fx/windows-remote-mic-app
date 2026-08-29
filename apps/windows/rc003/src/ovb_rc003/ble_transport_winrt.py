@@ -326,6 +326,24 @@ class RC003BleSession:
             # and characteristics with UNCACHED so the device is re-read on the
             # wire instead of trusting the local cache, matching the upstream
             # remote-bridge-hub transport.
+            #
+            # UNCACHED on a freshly-paired-but-never-queried device is not
+            # enough on its own: WinRT returns an empty result until the GATT
+            # table has been enumerated at least once. Force a full enumeration
+            # first (also UNCACHED) so the subsequent UUID-filtered query can
+            # succeed reliably. Observed flakiness before this call was added:
+            # 8/9 connection attempts returned an empty services list and
+            # raised "ATVV voice service not found on this device" before a
+            # single retry succeeded - visible in the production app log on a
+            # device paired under the Chinese name "小米蓝牙语音遥控器".
+            populate_result = await self._device.get_gatt_services_async(
+                winrt.bluetooth_cache_mode.UNCACHED
+            )
+            if populate_result.status != winrt.gatt_communication_status.SUCCESS:
+                raise ConnectionError(
+                    f"could not enumerate GATT services: {populate_result.status}"
+                )
+
             service_result = await self._device.get_gatt_services_for_uuid_with_cache_mode_async(
                 service_uuid, winrt.bluetooth_cache_mode.UNCACHED
             )
