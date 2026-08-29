@@ -87,6 +87,7 @@ already-torn-down session can never be processed after a reconnect.
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
 import threading
 import uuid
@@ -342,10 +343,43 @@ class RC003BleSession:
             # ``*_with_cache_mode_async`` overloads); an earlier revision
             # passed UNCACHED here, which the live WinRT projection rejects
             # with "Invalid parameter count" on every connect attempt.
+            #
+            # RECONNECT DIAGNOSTIC: log every populate step's outcome so
+            # when the link drops and the supervisor reconnects, we can
+            # see exactly what GattCommunicationStatus WinRT actually
+            # returns (the candidate states are SUCCESS, UNREACHABLE,
+            # PROTOCOL_ERROR, ACCESS_DENIED). This grounds a real fix -
+            # the production log already shows N consecutive 'ATVV voice
+            # service not found' failures during reconnect storms but
+            # without seeing the populate step's status, we cannot tell
+            # whether the flake is UNREACHABLE (transport cold) or
+            # something else. Look for the
+            # 'ble_transport_winrt: populate step status=' lines.
+            _log = logging.getLogger(__name__)
             populate_result = await self._device.get_gatt_services_async()
-            if populate_result.status != winrt.gatt_communication_status.SUCCESS:
+            _populate_status = populate_result.status
+            # Resolve the enum value to its symbolic name. winrt enums do
+            # NOT expose a _VALUES_TO_NAMES dict; they expose the enum
+            # members directly. Use ``GattCommunicationStatus(value).name``
+            # to recover the name (e.g. SUCCESS, UNREACHABLE,
+            # PROTOCOL_ERROR, ACCESS_DENIED). If the value is unknown,
+            # fall back to the integer. Same approach for any other enum
+            # the code may log in the future.
+            try:
+                _populate_status_name = winrt.gatt_communication_status(
+                    int(_populate_status)
+                ).name
+            except (ValueError, AttributeError, TypeError):
+                _populate_status_name = f'UNKNOWN({int(_populate_status)})'
+            _log.info(
+                "populate step status=%s (%s) services_count=%d",
+                _populate_status_name, int(_populate_status),
+                len(getattr(populate_result, 'services', []) or []),
+            )
+            if _populate_status != winrt.gatt_communication_status.SUCCESS:
                 raise ConnectionError(
-                    f"could not enumerate GATT services: {populate_result.status}"
+                    f"could not enumerate GATT services: "
+                    f"{_populate_status_name} ({int(_populate_status)})"
                 )
 
             service_result = await self._device.get_gatt_services_for_uuid_with_cache_mode_async(
