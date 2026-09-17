@@ -72,6 +72,16 @@ try {
     & powershell -ExecutionPolicy Bypass -File (Join-Path "build" "fetch-vb-cable.ps1")
     Assert-LastExitCode "fetch-vb-cable.ps1"
 
+    # The Frida Gadget is the same class of build input as VB-CABLE above, and
+    # was missing from this script entirely. Without it the frozen build starts,
+    # connects and looks healthy while Vol+/Vol-/Back are dead -
+    # frida_hid_tap_runtime.prepare_secure_runtime() raises FileNotFoundError
+    # before it checks whether the DLL is already extracted under PROGRAMDATA.
+    # The archive is gitignored, so it is absent unless something fetches it.
+    Write-Host "-- fetch + verify Frida Gadget --"
+    & powershell -ExecutionPolicy Bypass -File (Join-Path "build" "fetch-frida-gadget.ps1")
+    Assert-LastExitCode "fetch-frida-gadget.ps1"
+
     Write-Host "-- test suite --"
     $env:PYTHONPATH = Join-Path $RC003Root "src"
     # FULL `unittest discover`, matching windows-rc003-ci.yml's test-suite

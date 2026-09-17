@@ -172,7 +172,65 @@ jobs:
         shell: pwsh
         run: |
           ./build/fetch-vb-cable.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # This step used to carry `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`.
+          # It was a check that could not fail, and it is removed rather than left as
+          # a template to copy. `./script.ps1` runs in a CHILD scope and a child-scope
+          # assignment to $LASTEXITCODE does not leak to the caller, so the guard read
+          # a null; `$null -ne 0` is True, so the branch was taken; and `exit $null`
+          # returns 0 - an explicit SUCCESS exit. It was inert here only because
+          # nothing followed it, which is exactly what made it dangerous: the next
+          # line anyone added below it would have been silently dead. Measured
+          # 2026-09-17 on PS 5.1; the Frida step below carries the full note.
+          # fetch-vb-cable.ps1 signals failure by throwing, which already fails this
+          # step under the runner's $ErrorActionPreference='Stop'.
+
+      # The Frida Gadget is the same class of build input as the VB-CABLE pack
+      # above, and it was missing from this job entirely. Without it the frozen
+      # build starts, connects and looks healthy while Vol+/Vol-/Back are dead:
+      # frida_hid_tap_runtime.prepare_secure_runtime() raises FileNotFoundError
+      # before it checks whether the DLL is already extracted under PROGRAMDATA.
+      # The archive is gitignored (apps/windows/rc003/.gitignore:10), so a fresh
+      # checkout never has it, the spec's FRIDA_ASSET_DIR.glob("*.xz") silently
+      # collects nothing, and installer/RemoteMicRC003Setup.iss states outright
+      # that no Frida binary is bundled - so an end user of the artifact this job
+      # produces had no route at all to the three keys the project exists to
+      # recover. Measured 2026-09-17: a build made with an empty frida_assets/
+      # logged "RC003 HID TAP unavailable verified_gadget_not_installed" and the
+      # keys were dead.
+      - name: Fetch and verify Frida Gadget
+        shell: pwsh
+        run: |
+          ./build/fetch-frida-gadget.ps1
+
+          # Deliberately NO `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` here.
+          # `./script.ps1` runs in a CHILD scope, and a child-scope assignment to
+          # $LASTEXITCODE does not leak to the caller - so that line would read a
+          # null, `$null -ne 0` is True, and `exit $null` returns 0. The step would
+          # go green and exit BEFORE the artifact check below ever ran, which is
+          # exactly the check this gate exists for. Measured 2026-09-17 on PS 5.1:
+          # a child-scope script setting $LASTEXITCODE=42 left the caller's value
+          # empty, and `exit $null` returned 0 (control: `exit 7` returned 7).
+          # A throw already fails this step - the runner sets
+          # $ErrorActionPreference='Stop' - and build-candidate.ps1 checks the exit
+          # code correctly because it invokes a native `powershell -File` process,
+          # which does set $LASTEXITCODE in the caller's scope.
+
+          # Independently assert the ARTIFACT, not the script's exit status.
+          # Re-hashing the file against the pin is what makes this gate able to
+          # fail; the script's own exit status cannot carry that weight.
+          $gadget = "src/ovb_rc003/frida_assets/frida-gadget-17.15.3-windows-x86_64.dll.xz"
+          if (-not (Test-Path -LiteralPath $gadget)) {
+            Write-Error "Frida Gadget archive missing after fetch: $gadget - the frozen build would ship with Vol+/Vol-/Back dead."
+            exit 1
+          }
+          $expectedGadgetHash = "B566D70189B6D551AD8F4E0BEA24DE08A3D4C0F559BB35B2BDB67D45182240C2"
+          $actualGadgetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $gadget).Hash
+          if ($actualGadgetHash -ne $expectedGadgetHash) {
+            Write-Error "Frida Gadget hash mismatch: expected $expectedGadgetHash, got $actualGadgetHash"
+            exit 1
+          }
+          Write-Host "verified Frida Gadget archive: $gadget"
 
       - name: PyInstaller build (unsigned candidate)
         shell: pwsh

@@ -907,7 +907,70 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         next_step_start = self.text.index("- name:", step_start + 1)
         step_text = self.text[step_start:next_step_start]
         self.assertNotIn("continue-on-error", step_text)
-        self.assertIn("$LASTEXITCODE", step_text)
+
+        # This step must NOT gate on $LASTEXITCODE either - see
+        # test_frida_gadget_fetch_step_is_a_required_gate_not_best_effort below
+        # for the measurement. `./script.ps1` runs in a CHILD scope, so the
+        # caller's $LASTEXITCODE is null, `$null -ne 0` is True, and
+        # `exit $null` returns 0: such a guard exits SUCCESS and makes every
+        # following line dead code. This step carried exactly that guard until
+        # 2026-09-17; it was inert only because nothing followed it.
+        #
+        # Strip comment lines before asserting - the explanation names the
+        # construct on purpose, and a code assertion must not be satisfied (or
+        # broken) by prose.
+        code = "\n".join(
+            line for line in step_text.splitlines()
+            if not line.strip().startswith("#")
+        )
+        self.assertNotIn("$LASTEXITCODE", code)
+        self.assertIn("fetch-vb-cable.ps1", code)
+
+    def test_fetches_and_verifies_frida_gadget_before_pyinstaller_build(self):
+        # Same ordering requirement as VB-CABLE, for a sharper reason: the
+        # gadget archive is gitignored, so without a fetch step the spec's
+        # FRIDA_ASSET_DIR.glob("*.xz") silently collects nothing and the
+        # artifact ships with Vol+/Vol-/Back dead. Measured 2026-09-17 - a
+        # build made with an empty frida_assets/ logged
+        # "RC003 HID TAP unavailable verified_gadget_not_installed" and the
+        # three tap-recovered keys did not work.
+        self.assertIn("fetch-frida-gadget.ps1", self.text)
+        fetch_index = self.text.index("fetch-frida-gadget.ps1")
+        pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
+        self.assertLess(fetch_index, pyinstaller_index)
+
+    def test_frida_gadget_fetch_step_is_a_required_gate_not_best_effort(self):
+        step_start = self.text.index("- name: Fetch and verify Frida Gadget")
+        next_step_start = self.text.index("- name:", step_start + 1)
+        step_text = self.text[step_start:next_step_start]
+        self.assertNotIn("continue-on-error", step_text)
+
+        # This step must NOT gate on $LASTEXITCODE. `./script.ps1` runs in a
+        # CHILD scope and a child-scope assignment to $LASTEXITCODE does not
+        # leak to the caller, so `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`
+        # would read a null, `$null -ne 0` is True, and `exit $null` returns 0 -
+        # the step would exit green BEFORE the artifact check ever ran. Measured
+        # 2026-09-17 on PS 5.1: a child-scope script setting $LASTEXITCODE=42
+        # left the caller's value empty, and `exit $null` returned 0 (control:
+        # `exit 7` returned 7). build-candidate.ps1 checks the exit code
+        # correctly because it invokes a native `powershell -File` process.
+        #
+        # Strip comment lines before asserting: the explanation above names the
+        # forbidden construct on purpose, and a code assertion must not be
+        # satisfied - or broken - by prose.
+        code = "\n".join(
+            line for line in step_text.splitlines()
+            if not line.strip().startswith("#")
+        )
+        self.assertNotIn("$LASTEXITCODE", code)
+
+        # ...and it must verify the ARTIFACT, not just the script's exit
+        # status. fetch-frida-gadget.ps1 signals failure by throwing rather
+        # than by calling `exit`. Re-hashing the file against the pin is the
+        # part that can actually fail.
+        self.assertIn("Get-FileHash", code)
+        self.assertIn("Test-Path", code)
+        self.assertIn("B566D70189B6D551AD8F4E0BEA24DE08A3D4C0F559BB35B2BDB67D45182240C2", code)
 
 
 class BuildCandidateScriptTests(unittest.TestCase):
@@ -928,6 +991,21 @@ class BuildCandidateScriptTests(unittest.TestCase):
         pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
         self.assertLess(fetch_index, pyinstaller_index)
         assert_index = self.text.index('Assert-LastExitCode "fetch-vb-cable.ps1"')
+        self.assertGreater(assert_index, fetch_index)
+
+    def test_fetches_and_verifies_frida_gadget_before_pyinstaller_build(self):
+        # The same gate, for the same reason, in the other way this project
+        # builds a candidate. A gate present in only one of the two entry
+        # points is exactly how the hole appeared: the CI job fetched
+        # VB-CABLE but not the gadget, and neither did this script.
+        self.assertIn("fetch-frida-gadget.ps1", self.text)
+        fetch_index = self.text.index("fetch-frida-gadget.ps1")
+        pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
+        self.assertLess(fetch_index, pyinstaller_index)
+        # `& powershell -File ...` is a native invocation here, so
+        # Assert-LastExitCode genuinely reads that process's exit code -
+        # unlike the CI job's in-process `./script.ps1` form.
+        assert_index = self.text.index('Assert-LastExitCode "fetch-frida-gadget.ps1"')
         self.assertGreater(assert_index, fetch_index)
 
 
@@ -968,6 +1046,95 @@ class VbCablePinConsistencyTests(unittest.TestCase):
     def test_fetch_script_fails_closed_on_hash_mismatch(self):
         self.assertIn("SHA-256 mismatch", self.fetch_script_text)
         self.assertIn("throw", self.fetch_script_text)
+
+
+class FridaGadgetPinConsistencyTests(unittest.TestCase):
+    """The Frida Gadget archive name and SHA-256 are duplicated across the
+    fetch script, the boundary scan's allowlist, the CI workflow, the runtime
+    shim and the public third-party notices.
+
+    ``VbCablePinConsistencyTests`` above exists because this project has
+    already been bitten by exactly this kind of drift - and its own docstring
+    names the Frida Gadget pin as "this project's precedent for this exact
+    duplication pattern". That precedent had no guard of its own. The CI gate
+    added for the gadget is one more copy, so these tests pin every copy
+    against the ONE value the runtime actually enforces.
+    """
+
+    # Every place the digest is written out as a literal, and every place the
+    # archive filename is. frida_compat.py appears only in the NAME list: it
+    # assigns SHA256=frida_hid_tap_runtime.GADGET_ARCHIVE_SHA256, so it derives
+    # the digest and cannot drift. (The VbCablePinConsistencyTests docstring
+    # above calls it one of "the Frida Gadget pin's own two copies" - measured
+    # 2026-09-17, that is wrong; only the archive name is duplicated there.)
+    _HASH_SOURCES = (
+        "build/fetch-frida-gadget.ps1",
+        "build/check-public-boundary.ps1",
+        ".github/workflows/windows-rc003-ci.yml",
+        "tests/test_boundary_scan_replay.py",
+        "THIRD_PARTY_NOTICES.md",
+    )
+    _NAME_SOURCES = (
+        "build/fetch-frida-gadget.ps1",
+        "build/check-public-boundary.ps1",
+        ".github/workflows/windows-rc003-ci.yml",
+        "src/ovb_rc003/frida_compat.py",
+        "tests/test_boundary_scan_replay.py",
+    )
+
+    def setUp(self):
+        def resolve(relative):
+            candidate = _RC003_ROOT / relative
+            return candidate if candidate.is_file() else _REPO_ROOT / relative
+
+        # frida_hid_tap_runtime.py is absent from both lists on purpose: it is
+        # the authority these must all agree with, and it holds the digest as a
+        # multi-line concatenation, so it is read as a module rather than
+        # scanned as text.
+        self.hash_texts = {
+            rel: resolve(rel).read_text(encoding="utf-8")
+            for rel in self._HASH_SOURCES
+        }
+        self.name_texts = {
+            rel: resolve(rel).read_text(encoding="utf-8")
+            for rel in self._NAME_SOURCES
+        }
+
+    def test_archive_sha256_agrees_with_the_runtime_pin_wherever_it_is_copied(self):
+        from ovb_rc003 import frida_hid_tap_runtime
+
+        pinned = frida_hid_tap_runtime.GADGET_ARCHIVE_SHA256
+        self.assertEqual(len(pinned), 64, "runtime pin is not a full SHA-256")
+        for label, text in self.hash_texts.items():
+            self.assertIn(
+                pinned.upper(),
+                text.upper(),
+                f"gadget SHA-256 has drifted from the runtime pin in {label}",
+            )
+
+    def test_archive_name_agrees_with_the_runtime_pin_wherever_it_is_copied(self):
+        from ovb_rc003 import frida_hid_tap_runtime
+
+        name = frida_hid_tap_runtime.GADGET_ARCHIVE_NAME
+        for label, text in self.name_texts.items():
+            self.assertIn(
+                name,
+                text,
+                f"gadget archive name has drifted from the runtime pin in {label}",
+            )
+
+    def test_both_build_entry_points_fetch_it(self):
+        # A gate present in only one of the two ways this project builds a
+        # candidate is exactly how the hole appeared: the CI job fetched
+        # VB-CABLE but not the gadget, and neither did build-candidate.ps1.
+        self.assertIn(
+            "fetch-frida-gadget.ps1",
+            self.hash_texts[".github/workflows/windows-rc003-ci.yml"],
+        )
+        self.assertIn(
+            "fetch-frida-gadget.ps1",
+            _BUILD_CANDIDATE_PATH.read_text(encoding="utf-8"),
+        )
 
 
 class UserFacingDocumentationContractTests(unittest.TestCase):
