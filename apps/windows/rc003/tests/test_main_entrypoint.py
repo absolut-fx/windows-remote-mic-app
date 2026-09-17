@@ -36,10 +36,37 @@ def _make_guard_class(*, raise_on_enter=None, enter_calls=None):
     return _ScriptedGuard
 
 
+def _make_settings_guard_class(*, enter_calls=None):
+    """Builds a fake SettingsInstanceGuard CLASS (not instance).
+
+    The settings path - the no-argument default and ``--settings`` - enters the
+    *settings* guard, not the bridge one, and ``_run_settings_window()`` does so
+    before ``settings_ui.main()`` is ever called. Stubbing only
+    ``BridgeInstanceGuard`` therefore left these tests driving the REAL settings
+    guard, which raises ``DuplicateInstanceError`` whenever a real settings
+    window happens to be open: the suite silently required Rick's app to be
+    closed. ``enter_calls`` lets a test prove the settings path was actually
+    reached, so the stub cannot make the "never touches the guard" assertion
+    pass vacuously.
+    """
+
+    class _ScriptedSettingsGuard:
+        def __enter__(self):
+            if enter_calls is not None:
+                enter_calls.append(1)
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    return _ScriptedSettingsGuard
+
+
 class _ArgvRestoringTestCase(unittest.TestCase):
     def setUp(self):
         self._original_argv = sys.argv
         self._original_guard_cls = single_instance.BridgeInstanceGuard
+        self._original_settings_guard_cls = single_instance.SettingsInstanceGuard
         self._original_app_main = app.main
         self._original_notice = single_instance.show_bridge_startup_blocked_notice
         self._original_load_config = config.load_config
@@ -53,6 +80,16 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         # Tests that need to assert on the exact notice text/call count still
         # override this in their own body, same as before.
         single_instance.show_bridge_startup_blocked_notice = lambda message: None
+        # The settings path enters its OWN guard, so stub that too - otherwise
+        # these tests drive the real SettingsInstanceGuard and fail with
+        # DuplicateInstanceError whenever a real settings window is open, i.e.
+        # the module's result depended on whether Rick's app happened to be
+        # running. settings_guard_enters lets the settings tests prove the path
+        # was actually reached instead of passing on an early return.
+        self.settings_guard_enters = []
+        single_instance.SettingsInstanceGuard = _make_settings_guard_class(
+            enter_calls=self.settings_guard_enters
+        )
         config.load_config = lambda path: {
             "selected_device_profile": device_catalog.RC003_ID
         }
@@ -60,6 +97,7 @@ class _ArgvRestoringTestCase(unittest.TestCase):
     def tearDown(self):
         sys.argv = self._original_argv
         single_instance.BridgeInstanceGuard = self._original_guard_cls
+        single_instance.SettingsInstanceGuard = self._original_settings_guard_cls
         app.main = self._original_app_main
         single_instance.show_bridge_startup_blocked_notice = self._original_notice
         config.load_config = self._original_load_config
@@ -246,6 +284,10 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
             settings_ui.main = original_settings_main
 
         self.assertEqual(enter_calls, [])
+        # Non-vacuity: the settings path must actually have been reached.
+        # Without this the assertion above would still hold if main() returned
+        # early and never entered either guard.
+        self.assertEqual(self.settings_guard_enters, [1])
 
     def test_dry_run_never_touches_the_guard(self):
         enter_calls = []
@@ -285,6 +327,8 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
             settings_ui.main = original_settings_main
 
         self.assertEqual(enter_calls, [])
+        # Non-vacuity: --settings must reach the settings window path.
+        self.assertEqual(self.settings_guard_enters, [1])
 
     def test_diagnose_ble_candidates_never_touches_the_guard(self):
         enter_calls = []
