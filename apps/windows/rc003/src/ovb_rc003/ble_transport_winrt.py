@@ -90,6 +90,7 @@ import asyncio
 import logging
 import queue
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
@@ -204,6 +205,82 @@ def _import_winrt() -> WinRTModules:
         data_writer_factory=DataWriter,
         bluetooth_cache_mode=BluetoothCacheMode,
     )
+
+
+def _status_name(winrt: WinRTModules, status: Any) -> str:
+    """Resolve a ``GattCommunicationStatus`` value to its symbolic name.
+
+    winrt enums do NOT expose a ``_VALUES_TO_NAMES`` dict; they expose the
+    enum members directly, so ``GattCommunicationStatus(value).name`` is the
+    way to recover ``SUCCESS`` / ``UNREACHABLE`` / ``PROTOCOL_ERROR`` /
+    ``ACCESS_DENIED``. On the in-repo test fake the enum is a plain
+    int-constant class, so the lookup raises and falls back to
+    ``UNKNOWN(<int>)`` - the integer is always preserved so a production
+    line can still be mapped back to the canonical enum value.
+    """
+
+    try:
+        return winrt.gatt_communication_status(int(status)).name
+    except (ValueError, AttributeError, TypeError):
+        return f"UNKNOWN({int(status)})"
+
+
+def _service_from_enumeration(
+    populate_result: Any, service_uuid: uuid.UUID, log: logging.Logger
+) -> Any:
+    """Recover the ATVV service from the full enumeration we already made.
+
+    ``connect()`` makes two service calls, and only the second one fails:
+
+    * ``populate step`` - ``get_gatt_services_async()``, a full-table
+      enumeration. The production log shows 824/824 of these returning
+      SUCCESS (0) with ``services_count=9``, in ~0.2 s. Fast and
+      unconditional: Windows answers this from its persisted per-device
+      GATT cache, without touching the radio.
+    * ``service step`` - ``get_gatt_services_for_uuid_with_cache_mode_async``
+      with UNCACHED. This one goes to the wire. It is the call 812 connect
+      attempts died on, and its failures are bimodal in a way that names the
+      cause: the 703 "ATVV voice service not found" failures all ended
+      2.76-7.70 s after populate (median 7.687 s, and *zero* of them under
+      1 s) while the 98 attempts that succeeded finished in 0.49-6.87 s.
+      Every failure lands just past the slowest success - that is a timeout
+      ceiling, not a permission or protocol error, and it is reached while
+      the radio is still bringing the link up. Re-trying is what eventually
+      works: each attempt nudges the link further along, which is why the
+      app "takes a few goes to connect".
+
+    So when the wire query comes back without a usable service, fall back to
+    the enumeration we were already handed for free instead of throwing the
+    attempt away. This is strictly a repair of a failed attempt: it is only
+    reached on the branch that would otherwise raise, so no currently
+    successful connect can change behaviour, and if the UUID is missing from
+    the enumeration too the caller raises exactly as before.
+
+    Returns the matching service, or ``None`` when the enumeration does not
+    contain it either.
+    """
+    wanted = str(service_uuid).casefold()
+    enumerated = list(getattr(populate_result, "services", None) or [])
+    uuids = [str(getattr(service, "uuid", "")).casefold() for service in enumerated]
+    log.info(
+        "service step fallback: uuid-filtered query yielded no service, "
+        "searching the full enumeration count=%d wanted=%s uuids=%s",
+        len(uuids),
+        wanted,
+        uuids,
+    )
+    for service, enumerated_uuid in zip(enumerated, uuids):
+        if enumerated_uuid == wanted:
+            log.info(
+                "service step fallback: recovered %s from the full enumeration",
+                wanted,
+            )
+            return service
+    log.info(
+        "service step fallback: %s absent from the full enumeration too",
+        wanted,
+    )
+    return None
 
 
 async def discover_candidates(
@@ -356,25 +433,15 @@ class RC003BleSession:
             # something else. Look for the
             # 'ble_transport_winrt: populate step status=' lines.
             _log = logging.getLogger(__name__)
+            _started = time.perf_counter()
             populate_result = await self._device.get_gatt_services_async()
             _populate_status = populate_result.status
-            # Resolve the enum value to its symbolic name. winrt enums do
-            # NOT expose a _VALUES_TO_NAMES dict; they expose the enum
-            # members directly. Use ``GattCommunicationStatus(value).name``
-            # to recover the name (e.g. SUCCESS, UNREACHABLE,
-            # PROTOCOL_ERROR, ACCESS_DENIED). If the value is unknown,
-            # fall back to the integer. Same approach for any other enum
-            # the code may log in the future.
-            try:
-                _populate_status_name = winrt.gatt_communication_status(
-                    int(_populate_status)
-                ).name
-            except (ValueError, AttributeError, TypeError):
-                _populate_status_name = f'UNKNOWN({int(_populate_status)})'
+            _populate_status_name = _status_name(winrt, _populate_status)
+            _populate_count = len(getattr(populate_result, "services", []) or [])
             _log.info(
-                "populate step status=%s (%s) services_count=%d",
-                _populate_status_name, int(_populate_status),
-                len(getattr(populate_result, 'services', []) or []),
+                "populate step status=%s (%s) services_count=%d elapsed_ms=%.1f",
+                _populate_status_name, int(_populate_status), _populate_count,
+                (time.perf_counter() - _started) * 1000.0,
             )
             if _populate_status != winrt.gatt_communication_status.SUCCESS:
                 raise ConnectionError(
@@ -382,15 +449,40 @@ class RC003BleSession:
                     f"{_populate_status_name} ({int(_populate_status)})"
                 )
 
+            _started = time.perf_counter()
             service_result = await self._device.get_gatt_services_for_uuid_with_cache_mode_async(
                 service_uuid, winrt.bluetooth_cache_mode.UNCACHED
             )
-            if (
-                service_result.status != winrt.gatt_communication_status.SUCCESS
-                or not service_result.services
+            _service_status = service_result.status
+            _service_status_name = _status_name(winrt, _service_status)
+            _service_candidates = list(getattr(service_result, "services", None) or [])
+            _log.info(
+                "service step status=%s (%s) services_count=%d wanted=%s "
+                "elapsed_ms=%.1f",
+                _service_status_name, int(_service_status),
+                len(_service_candidates), service_uuid,
+                (time.perf_counter() - _started) * 1000.0,
+            )
+
+            # The wire query is the call that times out while the radio is
+            # still coming up (see _service_from_enumeration), so a failure
+            # here is not yet a verdict on the device. Only the branch that
+            # would otherwise raise falls back, so a connect that already
+            # works cannot change behaviour.
+            if _service_status == winrt.gatt_communication_status.SUCCESS and (
+                _service_candidates
             ):
-                raise ConnectionError("ATVV voice service not found on this device")
-            self._service = service_result.services[0]
+                self._service = _service_candidates[0]
+            else:
+                self._service = _service_from_enumeration(
+                    populate_result, service_uuid, _log
+                )
+            if self._service is None:
+                raise ConnectionError(
+                    f"ATVV voice service not found on this device ("
+                    f"{_service_status_name} ({int(_service_status)}), "
+                    f"{len(_service_candidates)} services)"
+                )
 
             self._tx_characteristic = await self._require_characteristic(
                 self._service, proto.VOICE_TX_UUID, winrt
@@ -428,20 +520,52 @@ class RC003BleSession:
             raise
 
     @staticmethod
-    async def _require_characteristic(service, characteristic_uuid: str, winrt: WinRTModules):
+    async def _require_characteristic(
+        service, characteristic_uuid: str, winrt: WinRTModules
+    ):
         parsed_uuid = uuid.UUID(characteristic_uuid)
         # Enumerate the service's full characteristic table with UNCACHED
         # (the exact-UUID lookup can return an empty/unsuccessful result when
         # the per-service GATT cache is incomplete) and match on the UUID.
+        _started = time.perf_counter()
         result = await service.get_characteristics_with_cache_mode_async(
             winrt.bluetooth_cache_mode.UNCACHED
         )
-        if result.status != winrt.gatt_communication_status.SUCCESS:
-            raise ConnectionError(f"ATVV characteristic not found: {characteristic_uuid}")
+        # RECONNECT DIAGNOSTIC: the same reason as the populate/service step
+        # lines in connect(), applied to the third GATT call. When a connect
+        # attempt dies on "ATVV characteristic not found", the status alone
+        # cannot distinguish the two very different causes: a transport that
+        # is not up yet (UNREACHABLE) versus a device whose characteristic
+        # table genuinely does not contain the UUID we asked for (SUCCESS
+        # with a short list). Log the status, the count, what we wanted and
+        # what came back, so a production line answers that question without
+        # a rebuild. The elapsed_ms field also shows whether this call is
+        # subject to the same cold-radio delay as the service query above.
+        _status = result.status
+        _status_label = _status_name(winrt, _status)
+        _found = [
+            str(getattr(c, "uuid", "")).casefold()
+            for c in list(getattr(result, "characteristics", None) or [])
+        ]
+        logging.getLogger(__name__).info(
+            "characteristic step status=%s (%s) characteristics_count=%d "
+            "wanted=%s found=%s elapsed_ms=%.1f",
+            _status_label, int(_status), len(_found),
+            str(parsed_uuid).casefold(), _found,
+            (time.perf_counter() - _started) * 1000.0,
+        )
+        if _status != winrt.gatt_communication_status.SUCCESS:
+            raise ConnectionError(
+                f"ATVV characteristic not found: {characteristic_uuid} ("
+                f"{_status_label} ({int(_status)}))"
+            )
         for characteristic in result.characteristics:
             if str(characteristic.uuid).casefold() == str(parsed_uuid).casefold():
                 return characteristic
-        raise ConnectionError(f"ATVV characteristic not found: {characteristic_uuid}")
+        raise ConnectionError(
+            f"ATVV characteristic not found: {characteristic_uuid} (status SUCCESS but returned "
+            f"{_found})"
+        )
 
     async def _write_tx(self, data: bytes) -> None:
         winrt = self._winrt or _import_winrt()

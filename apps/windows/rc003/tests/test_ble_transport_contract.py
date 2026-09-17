@@ -38,11 +38,13 @@ from ovb_rc003 import identity
 from ovb_rc003.ble_transport_winrt import (
     RC003BleSession,
     _is_terminal_os_error,
+    _status_name,
     discover_candidates,
 )
 
 from .fakes.fake_winrt import (
     FakeGattCommunicationStatus,
+    FakeGattDeviceService,
     FakeGattServicesResult,
     FakeWinRTEnvironment,
     gatt_service_instance_id,
@@ -255,6 +257,156 @@ class ConnectTests(unittest.TestCase):
             # Integer value present (the (NNN) suffix).
             self.assertRegex(line, r"populate step status=UNKNOWN\(\d+\)")
 
+    def test_characteristic_step_status_is_logged_on_every_connect(self):
+        """Regression (connect-diagnostic round 2): the *characteristic*
+        step must log its status too, not just the populate step.
+
+        Commit ad909b4 instrumented only the populate step, and three weeks
+        of production logs then showed 809/809 populate attempts logging
+        SUCCESS (0) services_count=9 while connect() still failed 792 times
+        with "ATVV voice service not found" and 18 times with "ATVV
+        characteristic not found". The status of the steps that actually
+        failed was never recorded, so the failure condition could never be
+        named. This test pins down that both lower steps log a status with
+        its integer value, so a future refactor cannot silently drop them.
+        """
+        import logging
+
+        env = FakeWinRTEnvironment()
+        captured: list[str] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record.getMessage())
+
+        cap = _Capture()
+        logger = logging.getLogger("ovb_rc003.ble_transport_winrt")
+        logger.addHandler(cap)
+        logger.setLevel(logging.INFO)
+        try:
+            async def scenario() -> None:
+                session, candidate = self._connect_session(
+                    env, on_pcm_frame=lambda samples: None
+                )
+                await session.connect(candidate)
+                await session.close()
+
+            _run(scenario())
+        finally:
+            logger.removeHandler(cap)
+
+        for prefix in ("service step status=", "characteristic step status="):
+            lines = [m for m in captured if prefix in m]
+            self.assertTrue(
+                lines,
+                f"expected at least one {prefix!r} log line, got: {captured!r}",
+            )
+            for line in lines:
+                # The fake's enum is a plain int-constant class, so name
+                # resolution falls back to UNKNOWN(int) - the integer must
+                # still be present to map back to the real enum in
+                # production (same contract as the populate-step test).
+                self.assertRegex(line, r"status=UNKNOWN\(\d+\)")
+
+    def test_characteristic_step_failure_logs_status_and_returned_uuids(self):
+        """Regression: when the per-service characteristic query fails, the
+        log line must carry the symbolic status, the count, and the UUIDs
+        the device actually returned - that is the evidence needed to tell
+        an ACCESS_DENIED/UNREACHABLE transport condition apart from a
+        genuine UUID mismatch. The raised error must name the status too,
+        instead of the bare "ATVV characteristic not found" that sent the
+        round-1 investigation looking in the wrong place.
+        """
+        import logging
+
+        env = FakeWinRTEnvironment()
+        service = env.service
+
+        async def denied(_cache_mode):
+            from .fakes.fake_winrt import FakeGattCharacteristicsResult
+
+            return FakeGattCharacteristicsResult(
+                FakeGattCommunicationStatus.ACCESS_DENIED, []
+            )
+
+        service.get_characteristics_with_cache_mode_async = denied
+
+        captured: list[str] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record.getMessage())
+
+        cap = _Capture()
+        logger = logging.getLogger("ovb_rc003.ble_transport_winrt")
+        logger.addHandler(cap)
+        logger.setLevel(logging.INFO)
+        try:
+            async def scenario():
+                session, candidate = self._connect_session(
+                    env, on_pcm_frame=lambda samples: None
+                )
+                await session.connect(candidate)
+
+            with self.assertRaises(ConnectionError) as ctx:
+                _run(scenario())
+        finally:
+            logger.removeHandler(cap)
+
+        # FakeGattCommunicationStatus.ACCESS_DENIED == 3; the fake cannot
+        # resolve the name, so the integer is what survives.
+        self.assertIn("UNKNOWN(3)", str(ctx.exception))
+
+        lines = [m for m in captured if "characteristic step status=" in m]
+        self.assertTrue(lines, f"expected a characteristic step log line, got: {captured!r}")
+        for line in lines:
+            self.assertIn("UNKNOWN(3)", line)
+            self.assertIn("characteristics_count=0", line)
+            self.assertIn("wanted=", line)
+            self.assertIn("found=[]", line)
+
+    def test_status_name_resolves_the_symbolic_name_like_real_winrt(self):
+        """The real winrt projection's enum IS callable
+        (``GattCommunicationStatus(3).name == 'ACCESS_DENIED'``), unlike the
+        test fake. This covers that branch directly, so the symbolic names
+        the production diagnostic relies on are proven to resolve rather
+        than only ever being exercised through the fake's UNKNOWN fallback.
+        """
+
+        class _RealLikeStatus:
+            SUCCESS = 0
+            UNREACHABLE = 1
+            PROTOCOL_ERROR = 2
+            ACCESS_DENIED = 3
+
+            _NAMES = {
+                0: "SUCCESS",
+                1: "UNREACHABLE",
+                2: "PROTOCOL_ERROR",
+                3: "ACCESS_DENIED",
+            }
+
+            def __init__(self, value):
+                if value not in self._NAMES:
+                    # The real winrt projection raises ValueError for an
+                    # out-of-range value ("N is not a valid
+                    # GattCommunicationStatus"), which is what
+                    # _status_name's fallback is written against.
+                    raise ValueError(value)
+                self.name = self._NAMES[value]
+
+        class _Winrt:
+            gatt_communication_status = _RealLikeStatus
+
+        self.assertEqual(_status_name(_Winrt, 0), "SUCCESS")
+        self.assertEqual(_status_name(_Winrt, 1), "UNREACHABLE")
+        self.assertEqual(_status_name(_Winrt, 2), "PROTOCOL_ERROR")
+        self.assertEqual(_status_name(_Winrt, 3), "ACCESS_DENIED")
+        # An out-of-range value must fall back to the integer rather than
+        # raising - the diagnostic must never be the thing that breaks a
+        # connect attempt.
+        self.assertEqual(_status_name(_Winrt, 99), "UNKNOWN(99)")
+
     def test_connect_enumerates_full_gatt_table_before_uuid_query(self):
         """Regression: ``get_gatt_services_async(UNCACHED)`` must be called
         before ``get_gatt_services_for_uuid_with_cache_mode_async`` on every
@@ -343,6 +495,156 @@ class ConnectTests(unittest.TestCase):
         with self.assertRaises(ConnectionError) as ctx:
             _run(scenario())
         self.assertIn("could not enumerate GATT services", str(ctx.exception))
+
+    # -- round 3: recovering the service step from the enumeration -----------
+    #
+    # connect() makes two service calls and only the second one - the
+    # UUID-filtered wire query with UNCACHED - times out while the radio is
+    # still bringing the link up. That is the call 812 production connect
+    # attempts died on. When it comes back without a usable service, connect()
+    # now recovers the ATVV service from the full enumeration it already made
+    # for free, instead of throwing the attempt away. These three tests pin the
+    # whole contract: the repair fires on the branch that would otherwise
+    # raise, it still raises when the enumeration cannot help, and it is
+    # invisible on the happy path.
+
+    def test_service_query_timeout_recovers_the_service_from_the_enumeration(self):
+        """The failing branch must adopt the enumerated service, not raise.
+
+        The UUID-filtered query is given the shape the production log shows for
+        every one of the 703 "ATVV voice service not found" failures:
+        non-SUCCESS with zero services, reached just past the slowest success -
+        a timeout ceiling, not a verdict on the device. The enumeration, which
+        Windows answers from its persisted per-device GATT cache without
+        touching the radio, still knows the service.
+        """
+
+        env = FakeWinRTEnvironment()
+        device = env.device
+        # Real WinRT GattDeviceService exposes .uuid; the fake models the
+        # characteristics but not that attribute, and the production matcher
+        # compares against it (casefolded, because WinRT hands back a Guid
+        # whose str() casing is not guaranteed).
+        env.service.uuid = uuid.UUID(proto.VOICE_SERVICE_UUID)
+
+        async def timed_out_query(service_uuid, cache_mode):
+            return FakeGattServicesResult(FakeGattCommunicationStatus.UNREACHABLE, [])
+
+        device.get_gatt_services_for_uuid_with_cache_mode_async = timed_out_query
+
+        async def scenario():
+            session, candidate = self._connect_session(
+                env, on_pcm_frame=lambda samples: None
+            )
+            await session.connect(candidate)
+            return session
+
+        with self.assertLogs("ovb_rc003.ble_transport_winrt", level="INFO") as captured:
+            session = _run(scenario())
+        try:
+            self.assertIs(
+                session._service,
+                env.service,
+                "connect() did not adopt the service recovered from the full "
+                "enumeration - the timed-out UUID query was treated as final",
+            )
+            self.assertIn(
+                "service step fallback: recovered",
+                "\n".join(captured.output),
+                "the recovery must be logged; a silent repair is unfalsifiable "
+                "in the production log this was diagnosed from",
+            )
+        finally:
+            _run(session.close())
+
+    def test_service_query_timeout_still_raises_when_enumeration_lacks_it(self):
+        """The fallback must not swallow a genuine "service absent" verdict.
+
+        When the UUID is missing from the enumeration too there is nothing to
+        repair, so connect() has to raise exactly what it raised before the
+        fallback existed. This is the control for the test above: without it, a
+        fallback that returned *something* unconditionally would still pass.
+        """
+
+        env = FakeWinRTEnvironment()
+        device = env.device
+
+        async def empty_enumeration():
+            return FakeGattServicesResult(FakeGattCommunicationStatus.SUCCESS, [])
+
+        async def timed_out_query(service_uuid, cache_mode):
+            return FakeGattServicesResult(FakeGattCommunicationStatus.UNREACHABLE, [])
+
+        device.get_gatt_services_async = empty_enumeration
+        device.get_gatt_services_for_uuid_with_cache_mode_async = timed_out_query
+
+        async def scenario():
+            session, candidate = self._connect_session(
+                env, on_pcm_frame=lambda samples: None
+            )
+            await session.connect(candidate)
+            return session
+
+        with self.assertRaises(ConnectionError) as ctx:
+            _run(scenario())
+        message = str(ctx.exception)
+        self.assertIn("ATVV voice service not found", message)
+        # The original failure detail must survive the fallback attempt: the
+        # status that caused it is the diagnostic the whole round-3 recovery
+        # was diagnosed from, so it must not be replaced by a vaguer message.
+        # The fake's status table is a plain int holder with no reverse lookup,
+        # so _status_name degrades to UNKNOWN(<code>) here; against real WinRT
+        # the same field reads UNREACHABLE.
+        self.assertIn("UNKNOWN(1)", message)
+        self.assertIn("0 services", message)
+
+    def test_the_service_fallback_stays_out_of_the_way_on_the_happy_path(self):
+        """A connect that already works must not change behaviour.
+
+        The fallback is reachable only from the branch that would otherwise
+        raise, so on a SUCCESS-with-services query it must not even run. The
+        enumeration is made to hold a *different* service object that carries
+        the same UUID - if the fallback ran it would pick that one, so the
+        identity of session._service is the assertion, not just the absence of
+        an exception.
+        """
+
+        env = FakeWinRTEnvironment()
+        device = env.device
+
+        enumeration_only = FakeGattDeviceService()
+        enumeration_only.uuid = uuid.UUID(proto.VOICE_SERVICE_UUID)
+
+        async def enumeration():
+            return FakeGattServicesResult(
+                FakeGattCommunicationStatus.SUCCESS, [enumeration_only]
+            )
+
+        device.get_gatt_services_async = enumeration
+
+        async def scenario():
+            session, candidate = self._connect_session(
+                env, on_pcm_frame=lambda samples: None
+            )
+            await session.connect(candidate)
+            return session
+
+        with self.assertLogs("ovb_rc003.ble_transport_winrt", level="INFO") as captured:
+            session = _run(scenario())
+        try:
+            self.assertIs(
+                session._service,
+                env.service,
+                "the happy path used the enumeration instead of the service the "
+                "UUID-filtered query returned",
+            )
+            self.assertNotIn(
+                "service step fallback",
+                "\n".join(captured.output),
+                "the fallback ran on a connect that did not need it",
+            )
+        finally:
+            _run(session.close())
 
 
 class NotificationProcessingTests(unittest.TestCase):
