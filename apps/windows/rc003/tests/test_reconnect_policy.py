@@ -216,7 +216,17 @@ class SupervisorIntegrationTests(unittest.TestCase):
     def _run(self, coro):
         import asyncio
 
-        return asyncio.new_event_loop().run_until_complete(coro)
+        # Explicitly closing the loop (XRBM-014 review round 2 evidence: a
+        # ResourceWarning for an unclosed test event loop) rather than letting
+        # it be garbage-collected. Every other loop helper in this suite does
+        # this; this one was missed, and on its own it emits both
+        # "unclosed event loop <ProactorEventLoop ...>" and two unclosed
+        # self-pipe sockets, which the CI ResourceWarning gate greps for.
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
     def test_supervisor_resets_policy_after_successful_connect(self):
         import asyncio
