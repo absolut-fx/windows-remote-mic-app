@@ -432,6 +432,84 @@ class WindowsCiWorkflowTests(unittest.TestCase):
     def test_runs_dry_run_smoke_check(self):
         self.assertIn("--dry-run", self.text)
 
+    def _step_text(self, name):
+        """One CI step's raw text, from its own ``- name:`` list-item line up
+        to the next step's header.
+
+        The leading ``- `` is load-bearing: an indented ``name:`` key inside a
+        ``with:`` block (e.g. the upload step's artifact name) is not a step
+        header and must never be mistaken for one.
+        """
+        start = self.text.index(f"- name: {name}")
+        end = self.text.index("- name:", start + 1)
+        return self.text[start:end]
+
+    def test_dry_run_smoke_check_can_actually_fail(self):
+        # Measured 2026-09-17 on PS 5.1: this build is console=False
+        # (GUI-subsystem), and PowerShell does not wait for a GUI application,
+        # so `& $builtExe --dry-run` never sets $LASTEXITCODE - it keeps
+        # whatever the previous statement left (null in this step). The step
+        # carried `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` until
+        # today: reading null, `$null -ne 0` is True, the branch is taken,
+        # `exit $null` returns 0 - so the gate exited GREEN and every line
+        # after it (including the artifact re-hash) was dead code. A gate that
+        # cannot fail is not a gate. build/install-dist.ps1:190-193 records
+        # this same measurement from when that script hit it first.
+        #
+        # Comments are stripped before every assertion below: the step's own
+        # prose names the forbidden construct on purpose, and an assertion
+        # must not be satisfied - or broken - by an explanation.
+        code = _strip_hash_comments(
+            self._step_text(
+                "Built-artifact dry-run smoke check (no GUI/BLE/HID/audio)"
+            )
+        )
+
+        # 1. No $LASTEXITCODE inspection anywhere in the step.
+        self.assertNotIn("$LASTEXITCODE", code)
+
+        # 2. A mechanism that genuinely waits and yields a real exit code.
+        self.assertIn("New-Object System.Diagnostics.ProcessStartInfo", code)
+        self.assertIn("[System.Diagnostics.Process]::Start($psi)", code)
+        self.assertIn("RedirectStandardOutput = $true", code)
+        self.assertIn("WaitForExit()", code)
+
+        # 3. ...and the branch is taken on THAT process's exit code, not on
+        #    anything ambient.
+        self.assertIn("$proc.ExitCode -ne 0", code)
+
+        # 4. Exit 0 alone is not enough: a frozen build that exits 0 early
+        #    would pass. The dry run prints its completion line only after
+        #    every ovb_rc003 module has imported, so the line is asserted.
+        self.assertIn("dry-run: all ovb_rc003 modules imported successfully", code)
+        self.assertIn("$stdout -notmatch", code)
+
+        # 5. Order is the whole point of the fix: the exit-code branch and the
+        #    output assertion must both be evaluated before the step can
+        #    report success.
+        exit_code_index = code.index("$proc.ExitCode -ne 0")
+        stdout_index = code.index("$stdout -notmatch")
+        passed_index = code.index("smoke check passed")
+        self.assertLess(exit_code_index, stdout_index)
+        self.assertLess(stdout_index, passed_index)
+
+        # 6. Every Write-Error branch must terminate nonzero. Without this,
+        #    the "failure" paths could report and then fall through to the
+        #    success line - a second, quieter way for the gate to be inert.
+        lines = [line.strip() for line in code.splitlines()]
+        error_branches = 0
+        for index, line in enumerate(lines):
+            if not line.startswith("Write-Error"):
+                continue
+            error_branches += 1
+            following = [rest for rest in lines[index + 1:] if rest]
+            self.assertTrue(
+                following and following[0] == "exit 1",
+                "a Write-Error branch must exit 1, not fall through - "
+                f"found {following[:1]!r} after {line!r}",
+            )
+        self.assertEqual(error_branches, 3)
+
     def test_compiles_inno_setup_installer(self):
         self.assertIn("ISCC.exe", self.text)
 
@@ -1007,6 +1085,64 @@ class BuildCandidateScriptTests(unittest.TestCase):
         # unlike the CI job's in-process `./script.ps1` form.
         assert_index = self.text.index('Assert-LastExitCode "fetch-frida-gadget.ps1"')
         self.assertGreater(assert_index, fetch_index)
+
+    def _smoke_check_block(self):
+        """The built-artifact dry-run smoke check, from its own banner line to
+        the end of the script's ``try`` block.
+
+        Deliberately scoped rather than whole-file: ``Assert-LastExitCode``'s
+        helper (defined near the top) legitimately contains ``$LASTEXITCODE``
+        - it reads a real native process's exit code, which is correct - so a
+        whole-file ``assertNotIn`` would be wrong, and one that happened to
+        pass would prove nothing.
+        """
+        start = self.text.index("-- built-artifact dry-run smoke check")
+        end = self.text.index('Write-Host "== build complete')
+        return self.text[start:end]
+
+    def test_dry_run_smoke_check_can_actually_fail(self):
+        # Same defect as the CI job's step, in the other entry point that
+        # builds a candidate - see WindowsCiWorkflowTests
+        # .test_dry_run_smoke_check_can_actually_fail for the measurement.
+        # Here the stale value was not even null: this script runs PyInstaller
+        # (a native command) on the line above, so $LASTEXITCODE held the 0
+        # PyInstaller left behind, and `Assert-LastExitCode "$builtExe
+        # --dry-run"` passed without having inspected the built app at all.
+        code = _strip_hash_comments(self._smoke_check_block())
+
+        # 1. The invocation that cannot work must be gone.
+        self.assertNotIn("& $builtExe", code)
+        self.assertNotIn("Assert-LastExitCode", code)
+        self.assertNotIn("$LASTEXITCODE", code)
+
+        # 2. A mechanism that genuinely waits and yields a real exit code.
+        self.assertIn("New-Object System.Diagnostics.ProcessStartInfo", code)
+        self.assertIn("[System.Diagnostics.Process]::Start($psi)", code)
+        self.assertIn("RedirectStandardOutput = $true", code)
+        self.assertIn("WaitForExit()", code)
+
+        # 3. ...and the failure branches hang off THAT process.
+        self.assertIn("$smokeProc.ExitCode -ne 0", code)
+
+        # 4. Exit 0 alone is not enough - the dry run's own completion line is
+        #    what proves the frozen app reached the end of its import check.
+        self.assertIn("dry-run: all ovb_rc003 modules imported successfully", code)
+        self.assertIn("$smokeOut -notmatch", code)
+
+        # 5. Order: both checks precede the success banner.
+        exit_code_index = code.index("$smokeProc.ExitCode -ne 0")
+        stdout_index = code.index("$smokeOut -notmatch")
+        self.assertLess(exit_code_index, stdout_index)
+
+        # 6. Every failure branch must THROW. This script has no step-level
+        #    exit code to set - the throw is the only thing that makes the
+        #    caller (and thus the build) fail.
+        for marker in (
+            'throw "expected built executable not found',
+            'throw "the built exe failed its dry run',
+            'throw "the built exe exited 0 without printing',
+        ):
+            self.assertIn(marker, code)
 
 
 class VbCablePinConsistencyTests(unittest.TestCase):

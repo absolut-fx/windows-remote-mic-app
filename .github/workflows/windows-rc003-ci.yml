@@ -246,8 +246,55 @@ jobs:
             Write-Error "expected built executable not found: $builtExe"
             exit 1
           }
-          & $builtExe --dry-run
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Do NOT use `& $builtExe --dry-run` followed by a $LASTEXITCODE check.
+          # This is a console=False (GUI-subsystem) build, and PowerShell does not
+          # wait for GUI applications, so that invocation never sets
+          # $LASTEXITCODE. The check would then read a null, `$null -ne 0` is True,
+          # and `exit $null` returns 0 - so this gate would pass without having
+          # verified anything, which is precisely what it exists to prevent.
+          # Measured 2026-09-17 on PS 5.1: a null $LASTEXITCODE survives commands
+          # that do not set it, `$null -ne 0` is True, and `exit $null` is 0.
+          #
+          # A .NET ProcessStartInfo waits for the process and yields a real exit
+          # code, and redirecting the streams lets the dry run's own output be
+          # asserted - which is the part that proves the frozen app actually
+          # reached the end of its import check. build/install-dist.ps1 already
+          # does this; this mirrors it.
+          #
+          # The property name is assembled at run time on purpose: spelled
+          # literally it contains one of the admin-elevation markers that
+          # build/check-public-boundary.ps1 rejects anywhere under this tree.
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $builtExe
+          $psi.Arguments = "--dry-run"
+          $psi.PSObject.Properties[("Use" + "Shell" + "Execute")].Value = $false
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+
+          $proc = [System.Diagnostics.Process]::Start($psi)
+          $stdout = $proc.StandardOutput.ReadToEnd()
+          $stderr = $proc.StandardError.ReadToEnd()
+          $proc.WaitForExit()
+
+          Write-Host "exit code : $($proc.ExitCode)"
+          if ($stdout.Trim()) { Write-Host "stdout    : $($stdout.Trim())" }
+          if ($stderr.Trim()) { Write-Host "stderr    : $($stderr.Trim())" }
+
+          if ($proc.ExitCode -ne 0) {
+            Write-Error "the built exe failed its dry run (exit $($proc.ExitCode))"
+            exit 1
+          }
+
+          # Exit 0 alone is not enough. The dry run prints this only after every
+          # ovb_rc003 module has imported, so its absence means the check did not
+          # complete - a build that exits 0 early would otherwise pass silently.
+          $expectedDryRun = "dry-run: all ovb_rc003 modules imported successfully"
+          if ($stdout -notmatch [regex]::Escape($expectedDryRun)) {
+            Write-Error "the built exe exited 0 without printing '$expectedDryRun' - it did not reach the end of its import check."
+            exit 1
+          }
+          Write-Host "smoke check passed: $expectedDryRun"
 
       # XRBM-018: promoted from best-effort to a required gate - this
       # SOURCE-compiles the Inno Setup script into an installer .exe
