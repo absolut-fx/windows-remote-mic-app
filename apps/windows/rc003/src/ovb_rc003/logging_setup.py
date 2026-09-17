@@ -20,11 +20,20 @@ via an injectable ``_open_directory`` callable (mirrors this package's other
 OS-facing modules, e.g. ``single_instance.py``) so
 tests/test_logging_setup_location.py can exercise every branch without
 actually invoking Windows Explorer.
+
+``get_logger()`` writes through a size-rotating handler rather than an
+unbounded ``FileHandler`` (``LOG_MAX_BYTES`` records the measured sizing, and
+``_ResilientRotatingFileHandler`` explains why it is not the stock one).
+Rotation always leaves the live log at ``app.log``, so ``log_file_path()``,
+``describe_log_location()`` and the settings window's "view log" button are
+all unaffected; the older segments appear beside it as ``app.log.1`` ...
+``app.log.5``.
 """
 
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 from dataclasses import dataclass
 from enum import Enum
@@ -36,7 +45,97 @@ from . import config
 LOGGER_NAME = "ovb_rc003"
 LOG_FILENAME = "app.log"
 
+# 2 MiB per file x 5 backups = a 12 MiB ceiling for a log that is the only
+# diagnostic channel for the Frida HID tap and the BLE reconnect path.
+#
+# Sizing is measured, not guessed: the app writes ~5 KB/hour after the log
+# flood fix (it was ~10 MB/hour before, which is what made an unbounded
+# FileHandler untenable - app.log.1 alone reached 140 MB). At ~5 KB/hour a
+# 2 MiB segment holds roughly two weeks of history, so rotation is rare
+# enough that the one-retry-per-record cost described on
+# _ResilientRotatingFileHandler below is never reached in practice.
+#
+# Rotation always leaves the live log at app.log, so log_file_path(),
+# describe_log_location() and the settings window's "view log" button are
+# all unaffected; the older segments appear beside it as app.log.1 ... app.log.5.
+# Keep these two values together - the ceiling is the product of them.
+LOG_MAX_BYTES = 2097152
+LOG_BACKUP_COUNT = 5
+
 _configured = False
+
+
+class _ResilientRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """A size-rotating handler that degrades to "keeps growing" rather than
+    "stops logging" when the rotation rename cannot run.
+
+    ``logging.handlers.RotatingFileHandler.doRollover`` closes the stream,
+    renames ``app.log`` to ``app.log.1``, and reopens - and its ``emit`` wraps
+    that whole call in ``except Exception: self.handleError(record)``. On
+    Windows the rename fails with ``PermissionError`` whenever any other
+    process holds the file open, which is the *normal* case here: this
+    package's own "view log" button hands ``app.log`` straight to Notepad.
+    When that happens the stock handler degrades badly, and quietly:
+
+    * the record that triggered the rotation is dropped - ``emit`` never
+      reaches ``FileHandler.emit``, because ``doRollover`` raised first;
+    * ``shouldRollover`` reopens the abandoned stream on the next record, so
+      the file is not lost, but it immediately reports "over the limit" again
+      and ``doRollover`` raises again - so **every later record that does not
+      fit in the remaining headroom is dropped too**;
+    * an ordinary log line is far larger than that headroom, so the file
+      creeps to a few bytes under ``maxBytes`` and then effectively stops
+      growing. Logging does not literally stop - a record short enough to fit
+      still lands - which is precisely what makes this hard to notice; and
+    * ``handleError`` reports each drop on stderr, which a windowed
+      (``console=False``) build does not have, so there is no symptom at all.
+
+    This log is the only diagnostic channel for the Frida HID tap and the BLE
+    reconnect path, so a log that quietly freezes at its cap is the outcome
+    worth designing against. Swallowing the rename failure and reopening the
+    stream unconditionally degrades to "the file keeps growing past
+    ``maxBytes``" - exactly the behaviour this app had before rotation
+    existed, which is a state we already know how to read.
+
+    The cost of that choice is one retry per record while the file is over the
+    limit (a close, a failed rename chain, and a reopen). At the measured
+    ~5 KB/hour that is irrelevant; it is only reached at all when a user is
+    holding the log open.
+    """
+
+    def doRollover(self) -> None:
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        try:
+            self._shift_backups()
+        except OSError:
+            # Deliberately swallowed. A failed rename (another process holding
+            # app.log open - see the class docstring) must not cost us the
+            # record that triggered the rotation: degrading to "the file keeps
+            # growing past maxBytes" beats dropping records with no symptom.
+            pass
+        if not self.delay:
+            self.stream = self._open()
+
+    def _shift_backups(self) -> None:
+        """``RotatingFileHandler.doRollover``'s rename chain, extracted so it
+        can fail as one unit and be caught as one unit.
+        """
+
+        if self.backupCount <= 0:
+            return
+        for index in range(self.backupCount - 1, 0, -1):
+            source = self.rotation_filename(f"{self.baseFilename}.{index}")
+            destination = self.rotation_filename(f"{self.baseFilename}.{index + 1}")
+            if os.path.exists(source):
+                if os.path.exists(destination):
+                    os.remove(destination)
+                os.rename(source, destination)
+        newest = self.rotation_filename(f"{self.baseFilename}.1")
+        if os.path.exists(newest):
+            os.remove(newest)
+        self.rotate(self.baseFilename, newest)
 
 
 def get_logger(root: Optional[Path] = None) -> logging.Logger:
@@ -49,7 +148,12 @@ def get_logger(root: Optional[Path] = None) -> logging.Logger:
     directory = log_dir(root)
     directory.mkdir(parents=True, exist_ok=True)
 
-    handler = logging.FileHandler(directory / LOG_FILENAME, encoding="utf-8")
+    handler = _ResilientRotatingFileHandler(
+        directory / LOG_FILENAME,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     )
