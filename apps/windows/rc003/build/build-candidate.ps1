@@ -74,48 +74,35 @@ try {
 
     Write-Host "-- test suite --"
     $env:PYTHONPATH = Join-Path $RC003Root "src"
-    # NOTE: full `unittest discover` is unsafe here:
-    #   - test_qt_settings_app.RunSettingsWindowShutdownCoverageTests crashes
-    #     inside apply_runtime (qt_settings_app.py:809, installEventFilter
-    #     called with a non-Qt object) and the parent unittest process hangs.
-    #   - test_qt_settings_app.ButtonsPageDirectSaveIntegrationTests is
-    #     flaky on offscreen Qt (click doesn't focus the ComboBox).
-    #   - test_tray_icon.TrayControllerTests.test_assets_directory_resolves_under_project
-    #     asserts an `assets/` dir which is intentionally absent in private-use builds.
-    #   - test_main_entrypoint has 2 pre-existing failures from the WIP
-    #     __main__.py refactor; tracked separately, tolerated here.
-    # Run only the verified-green suites (handoff 2026-08-25) plus
-    # test_bridge_launcher, test_single_instance, test_startup_shortcut,
-    # test_windows_diagnostics. test_qt_settings_app is reduced to the
-    # 4 in-scope classes; the others in that module are excluded.
-    $testArgs = @(
-        # ORDER MATTERS: `test_qt_settings_app.SettingsControllerTests`
-        # mutates Qt offscreen-platform plugin state in a way that
-        # breaks subsequent `subprocess.Popen([sys.executable, ...])`
-        # calls in `test_windows_diagnostics.RunBleDiagnosticsSubprocessTests`
-        # (Windows CreateProcess fails with WinError 2 / FileNotFoundError
-        # even though cmd[0] is a real, existing path). Run all
-        # non-Qt-spawning modules FIRST, then the Qt classes.
-        "tests.test_bridge_launcher",
-        "tests.test_single_instance",
-        "tests.test_startup_shortcut",
-        "tests.test_windows_diagnostics",
-        # tests.test_main_entrypoint OMITTED — its 2 WIP failures
-        # (`test_no_arguments_opens_settings_and_never_touches_the_guard`,
-        # `test_settings_never_touches_the_guard`) raise SystemExit(3)
-        # from a half-constructed SettingsInstanceGuard that breaks
-        # later test ordering. Pre-existing in `__main__.py` refactor
-        # and will be re-included when that lands.
-        "tests.test_qt_settings_app.SettingsControllerTests",
-        "tests.test_qt_settings_app.DiagnosticsControllerTests",
-        "tests.test_qt_settings_app.DiagnosticsShutdownOrderingTests",
-        "tests.test_qt_settings_app.DiagnosticsThreadLifecycleAtExitTests"
-    )
-    # Splat the array onto unittest's argv. PowerShell's parser treats
-    # dotted literals like `tests.x.Y` as member-access and refuses to
-    # pass them as bare string args; array splatting sidesteps that.
-    & $venvPython -W error::ResourceWarning -m unittest @testArgs
-    Assert-LastExitCode "python -m unittest (selected modules)"
+    # FULL `unittest discover`, matching windows-rc003-ci.yml's test-suite
+    # step exactly - same warning policy, same discovery roots, same pattern.
+    #
+    # This step used to run a hand-maintained subset of modules, because
+    # discovering everything was unrunnable. All of those reasons are fixed
+    # now, so the subset - and the PowerShell array-splatting workaround it
+    # needed in order to pass dotted test IDs as bare arguments - is gone.
+    # Re-measured 2026-09-16, all 1119 tests, 0 failures:
+    #   - test_tray_icon used to abort the ENTIRE run with 0xC0000409 and no
+    #     output at all. FIXED: an earlier module's bare QGuiApplication could
+    #     not host the tray's QMenu - every test module now obtains its app
+    #     from tests/qt_app.get_application().
+    #   - test_qt_settings_app.RunSettingsWindowShutdownCoverageTests used to
+    #     hang forever inside apply_runtime. FIXED: a 0 ms QTimer.singleShot
+    #     quit now lets app.exec() return.
+    #   - test_qt_settings_app.SettingsControllerTests used to leave
+    #     `sys.executable` pointing at a deliberately nonexistent temp .exe,
+    #     so every later subprocess spawn failed with FileNotFoundError - a
+    #     symptom that looks nothing like its cause. FIXED: the test restores
+    #     the value and asserts that it did.
+    #   - test_qt_settings_app.ButtonsPageDirectSaveIntegrationTests was red
+    #     on offscreen Qt ("click did not focus the ComboBox"). FIXED, and
+    #     the real cause was not Qt focus at all: the probe selected the
+    #     settings tab by a hard-coded index that went stale once a "General"
+    #     tab was inserted ahead of the mapping page, so it was clicking into
+    #     an invisible page. It now selects the tab by objectName and asserts
+    #     the target page is visible before interacting with it.
+    & $venvPython -W error::ResourceWarning -m unittest discover -s tests -t . -p "test_*.py"
+    Assert-LastExitCode "python -m unittest discover"
 
     Write-Host "-- PyInstaller build (unsigned candidate) --"
     & $venvPython -m PyInstaller (Join-Path "build" "RemoteMicRC003.spec") --distpath dist --workpath build\pyinstaller-work --noconfirm
