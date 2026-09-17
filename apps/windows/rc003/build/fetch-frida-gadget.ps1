@@ -1,16 +1,18 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Optionally fetches the official Frida Gadget release asset and verifies
-    its SHA-256 before use. This is the ONLY place this project ever
-    downloads a third-party binary, and it never runs automatically as part
-    of a normal build - the build (see build-candidate.ps1) proceeds without
-    it and the optional RC003 HID report tap stays disabled (see
+    Fetches the official Frida Gadget release asset and verifies its SHA-256
+    before use. This is the ONLY place this project ever downloads a
+    third-party binary, and it is a required gate in BOTH build-candidate.ps1
+    and windows-rc003-ci.yml, run immediately before PyInstaller - so a
+    candidate build either bundles the verified gadget or fails closed. It is
+    not wired into the .spec itself, so a source-only run that skips this step
+    still works; the optional RC003 HID report tap simply stays disabled (see
     ovb_rc003.frida_compat.RC003HidReportTap).
 
-    No binary is bundled in source control. VB-CABLE is intentionally not
-    fetched by this project at all (see XRBM-014's hard
-    boundary against auto-installing/downloading it).
+    No binary is bundled in source control. VB-CABLE is fetched for bundling
+    (see fetch-vb-cable.ps1) but is never installed or enabled by this project
+    (XRBM-014's hard boundary against auto-installing the driver).
 
 .PARAMETER Destination
     Where to place the verified asset. Defaults to the optional runtime asset

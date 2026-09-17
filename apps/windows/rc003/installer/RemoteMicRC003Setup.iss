@@ -19,8 +19,12 @@
 ;     never this installer, never silently, and only after the app is
 ;     already running and the user has explicitly clicked to do so. Voice
 ;     output itself is still chosen by the user inside the app.
-;   - No Frida binary is included (none is ever bundled - see
-;     ovb_rc003/frida_compat.py).
+;   - No Frida binary is bundled by SOURCE CONTROL - the archive is
+;     gitignored. It IS bundled into the build itself: build-candidate.ps1
+;     and windows-rc003-ci.yml both run build/fetch-frida-gadget.ps1 as a
+;     required gate (fetch, SHA-256 verify) before PyInstaller, so a packaged
+;     build carries the verified gadget and the RC003 tap works on a machine
+;     that never had the source tree. See ovb_rc003/frida_compat.py.
 
 #define AppName "Remote Mic · RC003"
 #define AppPublisher "Remote Mic contributors"
