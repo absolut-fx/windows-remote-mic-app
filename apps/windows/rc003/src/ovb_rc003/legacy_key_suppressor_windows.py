@@ -103,6 +103,15 @@ def build_physical_key_event(
     return event, message
 
 
+# Keys that can never be armed by ``arm_key_event``, so waiting for an arming
+# edge would only add latency to the hook for no benefit. The RC003 microphone
+# key is the only such key: its physical edge is rewritten in place by the voice
+# path rather than being emitted by this app, so there is no Raw Input arming
+# edge to correlate against. Consuming one would make the hook stall for the
+# whole consume window on every press of the voice key.
+_NEVER_ARMED_VK_CODES = frozenset({116})  # VK_F5 - the RC003 microphone key
+
+
 class LegacyKeySuppressor:
     def __init__(
         self,
@@ -224,8 +233,8 @@ class LegacyKeySuppressor:
         arrow.
         """
 
-        if int(vk_code) == 0x74:
-            # F5 is handled by the dedicated voice path below.
+        if int(vk_code) in _NEVER_ARMED_VK_CODES:
+            # Nothing can arm the voice key; see _NEVER_ARMED_VK_CODES.
             return
         expires_at = time.monotonic() + max(0.0, float(lifetime_seconds))
         armed = _ArmedKeyEvent(
@@ -244,7 +253,7 @@ class LegacyKeySuppressor:
             if len(self._armed_events) > 64:
                 self._armed_events = self._armed_events[-64:]
             self._armed_events_changed.notify_all()
-        _logger.info(
+        _logger.debug(
             "arm key edge: vk=0x%X scan=0x%X ext=%s pressed=%s window=%.3fs thread=%s",
             int(vk_code),
             int(scan_code),
@@ -272,9 +281,15 @@ class LegacyKeySuppressor:
         remote press is not turned into a double action by the hook releasing
         the original key before the app's replacement edge arrives. The
         window only applies to the RC003 key set; every other key passes
-        through with no latency.
+        through with no latency. The one exception is the voice key itself:
+        nothing can arm it, so it never waits -- see ``_NEVER_ARMED_VK_CODES``.
         """
 
+        if int(vk_code) in _NEVER_ARMED_VK_CODES:
+            # The voice key is never armed - nothing emits a matching Raw Input
+            # edge for it - so waiting the full consume window on every press
+            # would add latency for a match that can never arrive.
+            return False
         if self._rc003_vk_codes is not None and int(vk_code) not in self._rc003_vk_codes:
             return False
         effective_wait = (
@@ -289,7 +304,7 @@ class LegacyKeySuppressor:
                 )
                 if matched or now >= deadline:
                     elapsed = now - deadline + effective_wait
-                    _logger.info(
+                    _logger.debug(
                         "consume key edge: vk=0x%X scan=0x%X ext=%s pressed=%s "
                         "matched=%s armed=%d waited=%.3fs thread=%s",
                         int(vk_code),
@@ -502,42 +517,6 @@ class LegacyKeySuppressor:
             wintypes.LPARAM,
         )
         user32.CallNextHookEx.restype = ctypes.c_ssize_t
-        # TEMPORARY DIAGNOSTIC (RC003 keys-not-firing investigation): log every
-        # message that the low-level keyboard hook sees so we can determine
-        # whether Vol+/Vol-/Back arrive as WM_KEYDOWN, WM_APPCOMMAND, or
-        # nothing at all. This runs only when the module logger is at INFO.
-        # After we identify the right message type, this branch gets replaced
-        # by a focused handler that forwards to on_key_observe.
-        if n_code >= 0:
-            int_w = int(w_param)
-            int_l = int(l_param)
-            if int_w in (
-                WM_KEYDOWN,
-                WM_KEYUP,
-                WM_SYSKEYDOWN,
-                WM_SYSKEYUP,
-                0x0319,  # WM_APPCOMMAND
-            ):
-                if int_w == 0x0319:
-                    appcmd = (int_l >> 16) & 0xFFFF
-                    _logger.info(
-                        "hook msg: wparam=0x%04X(WM_APPCOMMAND) "
-                        "appcmd=0x%02X lparam=0x%08X",
-                        int_w,
-                        appcmd,
-                        int_l,
-                    )
-                else:
-                    event_dbg = KBDLLHOOKSTRUCT.from_address(int_l)
-                    _logger.info(
-                        "hook msg: wparam=0x%04X vk=0x%02X flags=0x%X "
-                        "scan=0x%X ext=%s",
-                        int_w,
-                        int(event_dbg.vkCode),
-                        int(event_dbg.flags),
-                        int(event_dbg.scanCode),
-                        bool(int(event_dbg.flags) & 1),
-                    )
         if n_code >= 0 and int(w_param) in (
             WM_KEYDOWN,
             WM_KEYUP,

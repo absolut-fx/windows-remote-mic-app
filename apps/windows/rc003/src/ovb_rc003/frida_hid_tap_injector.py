@@ -259,6 +259,11 @@ def inject_current_process(pid: int) -> None:
 
     if os.name != "nt":
         raise PermissionError("RC003 injector requires Windows administrator elevation")
+    # FIRST real step, before any target inspection: the privilege has to be in
+    # place before we probe anything about the host process, so a caller that
+    # cannot obtain SeDebug fails with PermissionError rather than a confusing
+    # "host changed" / "refusing non-WUDFHost target" message.
+    enable_debug_privilege()
     expected_pid = find_rc003_hidogatt_host_pid()
     if expected_pid != pid:
         raise RuntimeError(
@@ -270,7 +275,6 @@ def inject_current_process(pid: int) -> None:
     dll_hash = sha256_file(dll_path)
     if dll_hash != GADGET_DLL_SHA256:
         raise RuntimeError(f"verified Gadget changed before injection: {dll_hash}")
-    enable_debug_privilege()
     inject_library(pid, dll_path)
 
 
