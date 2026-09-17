@@ -5,4 +5,16 @@ build/third_party/
 build/pyinstaller-work/
 # PyInstaller's per-app working dir (created when the .spec is run without --workpath override).
 build/RemoteMicRC003/
+# Timestamped copies of the build output, kept next to the live dist/.
+dist-*/
 src/ovb_rc003/frida_assets/*.xz
+
+# Local dev launchers and the output they capture. These hardcode absolute
+# paths for this machine, and .cmd/.out are NOT in the boundary scan's
+# text-extension list (build/check-public-boundary.ps1 $textExtensions and
+# tests/test_boundary_scan_replay._TEXT_EXTENSIONS both omit them), so nothing
+# else would catch a personal path in them. The scheduled task runs the
+# installed exe directly now, so these are superseded anyway.
+launch-*.cmd
+launch-*.out
+launch-app-hidden.py
