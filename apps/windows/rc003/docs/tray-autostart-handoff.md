@@ -87,9 +87,26 @@ Source-mode offscreen launch (`QT_QPA_PLATFORM=offscreen PYTHONPATH=src .venv/Sc
 - `install_window_event_filter` rewritten to look up the filter class via cache and pass `QEvent.Type.Close` + tray controller
 - `run_settings_window()` calls `controller.apply_runtime(window)` after `engine.load()` succeeds and root objects are confirmed
 
-`src/ovb_rc003/tray_icon.py`: lazy `_ensure_qtwidgets()` (existing); `TrayController` exposes `show`, `hide`, `set_window_visible(bool)`, `set_shortcut_active(bool)`, signals `show_window_requested`, `quit_requested`, `is_available()`.
+`src/ovb_rc003/tray_icon.py`: lazy `_ensure_qtwidgets()` (existing); `TrayController` exposes `show`, `hide`, `set_window_visible(bool)`, signals `show_window_requested`, `quit_requested`, `is_available()`.
+
+> **Correction (2026-09-16).** This line originally also listed
+> `set_shortcut_active(bool)`. That method was **never implemented**: a repo-wide
+> grep found only the call site in `qt_settings_app.py` and its own error string.
+> The tray's canonical menu is Open / Help / About / Exit, so there was no
+> startup-folder item to sync either. The call site therefore raised
+> `AttributeError` on every `_refresh_start_with_windows_status()`, silently, and
+> has been removed. A tray "Open Startup folder" item would be a new feature, not
+> a fix.
 
 `src/ovb_rc003/startup_shortcut.py`: `enable(target_exe)`, `disable()`, `is_enabled()` all returning `StartupShortcutResult`; never raises (broad `Exception` catch in callers).
+
+> **Deletion (2026-09-16).** This module and its test file were removed after
+> the elevated-autostart rework (`elevated_autostart.py`) made them unreachable.
+> The last runtime importer (`SettingsController._on_tray_open_startup_folder`)
+> was an orphaned slot that called `startup_shortcut.open_startup_folder`, a
+> function that never existed in the module. Nothing in the frozen source
+> referenced it; the PyInstaller hiddenimport was dropped and an AST-level
+> guard now asserts that no orphaned slot can ship silently.
 
 `build/RemoteMicRC003.spec`: `console=False` (production). Temporarily toggled to `console=True` for the QApplication debug, then restored.
 
@@ -99,7 +116,7 @@ Source-mode offscreen launch (`QT_QPA_PLATFORM=offscreen PYTHONPATH=src .venv/Sc
 
 - `apply_runtime(window)` is the single integration point invoked from `run_settings_window()`. It owns filter install + tray instantiation + window-state hookup. Wrapped in try/except so a wiring failure never crashes the UI.
 - `_set_tray_enabled(bool)` and `_set_start_with_windows(bool)` route through `_apply_tray_to_runtime()` / `_refresh_start_with_windows_status()` respectively so toggles mutate runtime state immediately (not "on next launch").
-- `_refresh_start_with_windows_status()` calls `self._tray_controller.set_shortcut_active(self._start_with_windows)` after status updates, keeping tray-menu shortcut-active state in lockstep with the controller.
+- `_refresh_start_with_windows_status()` no longer calls `self._tray_controller.set_shortcut_active(self._start_with_windows)` — see the correction above. It now queries `elevated_autostart.get_state_dict()` on a background thread and marshals the answer back over `_autostartStateReady`.
 - Tray menu Show/Hide label is synced via `set_window_visible(bool)` from the window event filter and the show-window slot.
 - `_resolve_autostart_target` returns the frozen `sys.executable` (`RemoteMicRC003.exe`) in production; dev-mode fallback uses the source tree to construct a candidate.
 - `QApplication` not `QGuiApplication` — required because tray uses QtWidgets.

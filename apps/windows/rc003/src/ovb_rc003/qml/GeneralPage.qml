@@ -133,7 +133,7 @@ Item {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
                         text: qsTr(
-                            "启用后将在当前用户的\"启动\"文件夹放置一个指向本程序的快捷方式，登录后自动打开设置窗口。"
+                            "启用后注册并开启开机自启动计划任务（RemoteMicRC003-Elevated）：登录时由任务计划程序以管理员权限启动本程序。必须以管理员权限运行，Frida 才能注入 WUDFHost，音量/返回键才可用。"
                         )
                         color: tokens.textSecondary
                         font.pixelSize: tokens.fontSizeSmall
@@ -150,69 +150,16 @@ Item {
                 }
             }
 
-            // -- Bridge auto-start (headless ``--bridge`` on login) ---------
-            // Sibling rectangle to the autostart toggle above. The two
-            // toggles are independent on disk - one writes
-            // ``RemoteMicRC003.lnk`` (settings window), the other writes
-            // ``RemoteMicRC003-Bridge.lnk`` (this one). Same Switch
-            // binding pattern, same ``when: !pressed`` loop guard.
-            Rectangle {
-                Layout.fillWidth: true
-                radius: tokens.cornerRadiusLarge
-                color: tokens.surface
-                border.color: tokens.border
-                border.width: 1
-                implicitHeight: bridgeAutostartColumn.implicitHeight + tokens.spacingLarge * 2
-
-                ColumnLayout {
-                    id: bridgeAutostartColumn
-                    anchors.fill: parent
-                    anchors.margins: tokens.spacingLarge
-                    spacing: tokens.spacingSmall
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Label {
-                            text: qsTr("登录后后台运行调度桥")
-                            font.pixelSize: tokens.fontSizeTitle
-                            font.bold: true
-                            color: tokens.textPrimary
-                            Layout.fillWidth: true
-                        }
-                        Switch {
-                            id: bridgeAutostartSwitch
-                            objectName: "bridgeAutoStartSwitch"
-                            text: ""
-                            checked: SettingsController.bridgeAutoStart
-                            onCheckedChanged: {
-                                if (checked !== SettingsController.bridgeAutoStart
-                                        && !pressed) {
-                                    SettingsController.setBridgeAutoStart(checked)
-                                }
-                            }
-                            Accessible.name: qsTr("登录后后台运行调度桥")
-                        }
-                    }
-                    Label {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        text: qsTr(
-                            "启用后将在当前用户的\"启动\"文件夹放置第二个快捷方式（RemoteMicRC003-Bridge.lnk），登录后无窗口运行调度桥服务。"
-                        )
-                        color: tokens.textSecondary
-                        font.pixelSize: tokens.fontSizeSmall
-                    }
-                    Label {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        text: SettingsController.bridgeAutoStartStatusText
-                        color: SettingsController.bridgeAutoStartStatusIsError
-                            ? tokens.errorColor
-                            : tokens.textSecondary
-                        font.pixelSize: tokens.fontSizeSmall
-                    }
-                }
-            }
+            // NOTE: the "登录后后台运行调度桥" (bridge autostart) card used to sit
+            // here. It bound SettingsController.bridgeAutoStart,
+            // .bridgeAutoStartStatusText and .bridgeAutoStartStatusIsError -
+            // none of which were ever declared on the controller (grep found
+            // `bridgeAutoStart` only in this file), so Qt rendered it with empty
+            // bindings and printed "Unable to assign [undefined] to bool /
+            // QString" warnings on every launch. It could never have done
+            // anything, and the headless `--bridge` mode it advertised was
+            // removed at the user's request. Deleted rather than left as a
+            // second control that also claims to own startup.
 
             // -- Closing-behavior summary ------------------------------------
             Rectangle {
