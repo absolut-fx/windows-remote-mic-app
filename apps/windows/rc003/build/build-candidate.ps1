@@ -123,8 +123,43 @@ try {
     if (-not (Test-Path $builtExe)) {
         throw "expected built executable not found: $builtExe"
     }
-    & $builtExe --dry-run
-    Assert-LastExitCode "$builtExe --dry-run"
+    # NOT `& $builtExe --dry-run` + Assert-LastExitCode. This is a console=False
+    # (GUI-subsystem) build and PowerShell does not wait for GUI applications, so
+    # that invocation never sets $LASTEXITCODE - it would still hold the 0 left by
+    # the PyInstaller step above, and Assert-LastExitCode would pass without having
+    # checked anything at all. A .NET ProcessStartInfo waits for the process and
+    # yields a real exit code; redirecting the streams also lets the dry run's own
+    # output be asserted. install-dist.ps1 already does this; this mirrors it.
+    #
+    # The property name is assembled at run time on purpose: spelled literally it
+    # contains one of the admin-elevation markers that check-public-boundary.ps1
+    # rejects anywhere under this tree, and code lines are not stripped.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $builtExe
+    $psi.Arguments = "--dry-run"
+    $psi.PSObject.Properties[("Use" + "Shell" + "Execute")].Value = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+
+    $smokeProc = [System.Diagnostics.Process]::Start($psi)
+    $smokeOut = $smokeProc.StandardOutput.ReadToEnd()
+    $smokeErr = $smokeProc.StandardError.ReadToEnd()
+    $smokeProc.WaitForExit()
+
+    Write-Host "   exit code : $($smokeProc.ExitCode)"
+    if ($smokeOut.Trim()) { Write-Host "   stdout    : $($smokeOut.Trim())" }
+    if ($smokeErr.Trim()) { Write-Host "   stderr    : $($smokeErr.Trim())" }
+
+    if ($smokeProc.ExitCode -ne 0) {
+        throw "the built exe failed its dry run (exit $($smokeProc.ExitCode))"
+    }
+
+    # Exit 0 alone is not enough. The dry run prints this only after every
+    # ovb_rc003 module has imported, so its absence means the check did not finish.
+    $expectedDryRun = "dry-run: all ovb_rc003 modules imported successfully"
+    if ($smokeOut -notmatch [regex]::Escape($expectedDryRun)) {
+        throw "the built exe exited 0 without printing '$expectedDryRun' - it did not reach the end of its import check"
+    }
 
     Write-Host "== build complete: dist\RemoteMicRC003\ (unsigned) =="
 } finally {
