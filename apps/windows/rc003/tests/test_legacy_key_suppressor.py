@@ -169,6 +169,105 @@ class LegacyKeySuppressorRaceTests(unittest.TestCase):
         self.assertTrue(matched)
 
 
+class LegacyKeySuppressorVoiceKeyWaitTests(unittest.TestCase):
+    """The voice key is the one RC003 key that can never be armed, so it must
+    never pay the arming wait either.
+
+    The RC003 microphone key's physical edge is rewritten in place by the voice
+    path, so nothing emits a matching Raw Input arming edge for it. Waiting the
+    consume window for a match that can never arrive would add that whole
+    window of latency to every press of the microphone key - the key the user
+    holds while talking. ``_NEVER_ARMED_VK_CODES`` is what prevents that, and
+    the exemption has to stay *narrow*: the other RC003 keys do get a real
+    arming edge, and exempting them would bring back the double-action the
+    window exists to prevent.
+    """
+
+    _RC003_KEYS = frozenset({0x74, 0x26, 0x27, 0x25, 0x28})
+    _VOICE_VK = 0x74  # VK_F5, the RC003 microphone key
+    _VOICE_SCAN = 0x3F  # F5's scan code
+
+    def _gate(self, *, consume_wait_seconds=0.060):
+        return suppressor.LegacyKeySuppressor(
+            {self._VOICE_VK},
+            rc003_vk_codes=self._RC003_KEYS,
+            consume_wait_seconds=consume_wait_seconds,
+        )
+
+    def test_only_the_voice_key_is_exempt_from_arming(self):
+        # The exemption must name exactly one key. A blanket exemption for the
+        # RC003 set would look identical in the two tests below while silently
+        # disabling arming for the arrow keys.
+        self.assertEqual(
+            suppressor._NEVER_ARMED_VK_CODES,
+            frozenset({self._VOICE_VK}),
+            "the never-armed set must contain the voice key and nothing else",
+        )
+
+        for vk in sorted(self._RC003_KEYS):
+            with self.subTest(vk=hex(vk)):
+                gate = self._gate()
+                gate.arm_key_event(vk, 0x48, True, True)
+                if vk == self._VOICE_VK:
+                    self.assertEqual(
+                        gate._armed_events,
+                        [],
+                        "the voice key must not be armable",
+                    )
+                else:
+                    self.assertEqual(
+                        len(gate._armed_events),
+                        1,
+                        f"RC003 key {vk:#x} must still be armable",
+                    )
+
+    def test_voice_key_is_never_added_to_the_armed_list(self):
+        gate = self._gate()
+        gate.arm_key_event(self._VOICE_VK, self._VOICE_SCAN, False, True)
+        gate.arm_key_event(self._VOICE_VK, self._VOICE_SCAN, False, False)
+        self.assertEqual(gate._armed_events, [])
+
+        # Control: the list is genuinely being written to in this setup, so the
+        # assertion above is about the voice key and not about arm_key_event
+        # being a no-op here.
+        gate.arm_key_event(0x26, 0x48, True, True)
+        self.assertEqual(len(gate._armed_events), 1)
+
+    def test_voice_key_skips_the_consume_window_entirely(self):
+        # A deliberately absurd window: if the exemption were dropped this test
+        # would block for ten seconds and then fail the bound, rather than
+        # passing because the wait happened to be short.
+        gate = self._gate(consume_wait_seconds=10.0)
+        start = time.monotonic()
+        self.assertFalse(
+            gate.consume_armed_key_event(
+                self._VOICE_VK, self._VOICE_SCAN, False, True
+            )
+        )
+        self.assertLess(
+            time.monotonic() - start,
+            0.25,
+            "the voice key waited for an arming edge that can never arrive",
+        )
+
+    def test_other_rc003_keys_still_pay_the_window(self):
+        # The control for the test above: with nothing armed, a non-voice RC003
+        # key really does block for the consume window. Without this, the voice
+        # key's instant return would be indistinguishable from the window never
+        # being applied at all.
+        window = 0.30
+        gate = self._gate(consume_wait_seconds=window)
+        start = time.monotonic()
+        self.assertFalse(gate.consume_armed_key_event(0x26, 0x48, True, True))
+        elapsed = time.monotonic() - start
+        self.assertGreaterEqual(
+            elapsed,
+            window * 0.8,
+            f"a non-voice RC003 key returned after only {elapsed:.3f}s - the "
+            f"consume window was not applied",
+        )
+
+
 class LegacyKeySuppressorLifecycleTests(unittest.TestCase):
     def test_empty_suppressor_is_a_noop(self):
         gate = suppressor.LegacyKeySuppressor(set())
