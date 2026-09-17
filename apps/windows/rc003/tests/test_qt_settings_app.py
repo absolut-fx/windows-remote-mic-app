@@ -20,7 +20,9 @@ whole point of that design is a real, OS-confirmed hard bound this project
 cannot prove any other way.
 """
 
+import ast
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -40,9 +42,14 @@ from ovb_rc003 import (
     remote_layout,
     settings_ui,
     shell_targets,
+    tray_icon,
     vb_cable_bundle,
     windows_diagnostics,
 )
+
+# Shared, widgets-capable Qt application. Never construct one directly in a
+# test - see tests/qt_app.py for the 0xC0000409 abort that causes.
+from . import qt_app
 
 
 def _has_pyside6() -> bool:
@@ -622,6 +629,7 @@ class SettingsControllerTests(unittest.TestCase):
         # ``python -m unittest`` itself is being invoked.
         with mock.patch.object(sys, "frozen", new=None, create=True):
             # Confirm a misleading python.exe .exe path is NOT chosen.
+            original_executable = sys.executable
             sys.executable = str(
                 Path(self._tmpdir.name) / "totally-not-a-real-exe.exe"
             )
@@ -634,7 +642,13 @@ class SettingsControllerTests(unittest.TestCase):
                 result = self.Controller._resolve_autostart_target()
             finally:
                 # Restore sys.executable so we don't pollute later tests.
-                pass
+                # This is a DIRECT assignment, so mock.patch.object cannot
+                # undo it. Leaving it pointing at a nonexistent path made
+                # every later subprocess-spawning test in the same run fail
+                # with FileNotFoundError [WinError 2] - measured on
+                # test_windows_diagnostics, four tests, from a module that
+                # never touches sys.executable itself.
+                sys.executable = original_executable
 
         # The test runner is itself python.exe, so the candidate branch
         # WOULD have grabbed it pre-fix. Post-fix, the function must
@@ -681,23 +695,15 @@ class SettingsControllerTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
-class BridgeAutoStartControllerTests(unittest.TestCase):
-    """New ``bridgeAutoStart`` property + ``setBridgeAutoStart`` slot.
+class SettingsControllerUntestedSurfaceRegressionTests(unittest.TestCase):
+    """The corners of SettingsController the rest of this file never reaches:
+    the bridge-handle liveness property, the background autostart status read,
+    and the tray surface the controller is allowed to call.
 
-    Mirrors the existing autostart toggle shape but writes a separate
-    shortcut file (``RemoteMicRC003-Bridge.lnk`` with ``--bridge``
-    arg) so settings-window auto-start and bridge auto-start can be
-    on/off independently.
-
-    These tests deliberately DO NOT touch the disk shortcut at all -
-    ``startup_shortcut.enable``/``disable``/``is_enabled`` are
-    monkeypatched to record the call args, so the test stays platform-
-    agnostic and does not require PowerShell, a real Windows
-    %APPDATA%\\Microsoft\\Windows\\Start Menu\\Startup folder, or a
-    frozen build. The point is to prove the controller calls the
-    right helper with the right arguments, NOT to prove PowerShell
-    can write a .lnk file - that already has its own dedicated tests
-    in tests/test_startup_shortcut.py.
+    They sit together because they share one shape - each guards a silent
+    failure that produced no exception and no error line: a property that
+    reported a stale value, a status read that reported a state it could not
+    observe, or a tray call that did not exist.
     """
 
     def setUp(self):
@@ -709,176 +715,203 @@ class BridgeAutoStartControllerTests(unittest.TestCase):
             os.environ, {"LOCALAPPDATA": self._tmpdir.name}
         )
         self._env_patch.start()
-        # Monkey-patch startup_shortcut at the controller's import site.
-        # The controller captured ``startup_shortcut`` as a module-level
-        # binding inside qt_settings_app, so we have to patch the name
-        # there (not at the original startup_shortcut module).
-        from ovb_rc003 import startup_shortcut as real_sc
-        self._real_sc = real_sc
-        self._patcher_enable = mock.patch.object(
-            qt_settings_app.startup_shortcut, "enable", autospec=True
-        )
-        self._patcher_disable = mock.patch.object(
-            qt_settings_app.startup_shortcut, "disable", autospec=True
-        )
-        self._patcher_is_enabled = mock.patch.object(
-            qt_settings_app.startup_shortcut, "is_enabled", autospec=True
-        )
-        self.fake_enable = self._patcher_enable.start()
-        self.fake_disable = self._patcher_disable.start()
-        self.fake_is_enabled = self._patcher_is_enabled.start()
-        # Default state: nothing enabled. The fake tracks disk truth
-        # for us: ``enable()`` flips it to True, ``disable()`` to
-        # False - exactly what a real Windows Startup-folder write
-        # would do (production controller code calls
-        # ``is_enabled()`` right after a successful enable/disable
-        # to update the UI, so we have to mimic that side effect).
-        self._disk_state = {"bridge": False, "default": False}
-
-        def fake_is_enabled(name=None, **_kwargs):
-            if name == self._real_sc._BRIDGE_STARTUP_FOLDER_NAME:
-                return self._disk_state["bridge"]
-            return self._disk_state["default"]
-
-        from ovb_rc003.startup_shortcut import StartupShortcutOutcome
-
-        def fake_enable(_target_exe, **_kwargs):
-            name = _kwargs.get("name", self._real_sc._STARTUP_FOLDER_NAME)
-            if name == self._real_sc._BRIDGE_STARTUP_FOLDER_NAME:
-                self._disk_state["bridge"] = True
-            else:
-                self._disk_state["default"] = True
-            return real_sc.StartupShortcutResult(
-                outcome=StartupShortcutOutcome.ENABLED,
-                message="已启用。",
-            )
-
-        def fake_disable(name=None, **_kwargs):
-            if name == self._real_sc._BRIDGE_STARTUP_FOLDER_NAME:
-                self._disk_state["bridge"] = False
-            else:
-                self._disk_state["default"] = False
-            return real_sc.StartupShortcutResult(
-                outcome=StartupShortcutOutcome.DISABLED,
-                message="已禁用。",
-            )
-
-        self.fake_is_enabled.side_effect = fake_is_enabled
-        self.fake_enable.side_effect = fake_enable
-        self.fake_disable.side_effect = fake_disable
+        # ``_get_bridge_running`` clears the module-level registry, so put it
+        # back afterwards - a leaked handle would be stopped by atexit.
+        self._original_bridge_handle = qt_settings_app._bridge_handle_global
 
     def tearDown(self):
-        self._patcher_enable.stop()
-        self._patcher_disable.stop()
-        self._patcher_is_enabled.stop()
+        qt_settings_app._bridge_handle_global = self._original_bridge_handle
         self._env_patch.stop()
         self._tmpdir.cleanup()
 
     def _make_controller(self):
-        model = self.Model()
-        controller = self.Controller(model)
-        return controller, model
+        return self.Controller(self.Model())
 
-    def test_bridge_auto_start_defaults_to_false(self):
-        controller, _ = self._make_controller()
-        self.assertFalse(controller.bridgeAutoStart)
-        self.assertEqual(controller.bridgeAutoStartStatusText, "")
-        self.assertFalse(controller.bridgeAutoStartStatusIsError)
+    # -- bridgeRunning -----------------------------------------------------
 
-    def test_set_bridge_auto_start_true_calls_enable_with_bridge_name_and_arg(self):
-        """The whole point of this task: confirm the @Slot(bool)
-        decorator works (round-1 root cause was a bare @Slot() above a
-        bool-arg function), AND that ``enable`` is called with the
-        bridge shortcut name + ``--bridge`` extra_args."""
-        controller, _ = self._make_controller()
-        controller.setBridgeAutoStart(True)
-        self.fake_enable.assert_called_once()
-        call_kwargs = self.fake_enable.call_args.kwargs
-        # Must use the bridge shortcut name (NOT the default).
-        self.assertEqual(
-            call_kwargs.get("name"),
-            self._real_sc._BRIDGE_STARTUP_FOLDER_NAME,
-            "setBridgeAutoStart(True) must call enable with name="
-            "_BRIDGE_STARTUP_FOLDER_NAME, got %r" % call_kwargs.get("name"),
-        )
-        # Must pass --bridge extra_args.
-        self.assertEqual(
-            call_kwargs.get("extra_args"),
-            "--bridge",
-            "setBridgeAutoStart(True) must call enable with extra_args="
-            "--bridge, got %r" % call_kwargs.get("extra_args"),
-        )
-        # Must NOT have written a config.json entry (autostart is
-        # tracked by the .lnk file, not the JSON config).
-        self.assertFalse(controller.bridgeAutoStartStatusIsError)
-        # Once enable returns SUCCESS, the controller's cached state
-        # should flip to True.
-        self.assertTrue(controller.bridgeAutoStart)
-        self.assertIn("已加入开机启动", controller.bridgeAutoStartStatusText)
+    def test_bridge_running_is_false_without_a_handle(self):
+        controller = self._make_controller()
+        self.assertIsNone(controller._bridge_handle)
+        self.assertFalse(controller.bridgeRunning)
 
-    def test_set_bridge_auto_start_false_calls_disable_with_bridge_name(self):
-        controller, _ = self._make_controller()
-        # Seed state so the setter has work to do (it short-circuits when
-        # target == cached == disk).
-        controller._bridge_auto_start = True
-        controller.setBridgeAutoStart(False)
-        self.fake_disable.assert_called_once_with(
-            name=self._real_sc._BRIDGE_STARTUP_FOLDER_NAME
-        )
-        self.assertFalse(controller.bridgeAutoStart)
-        self.assertIn("未加入开机启动", controller.bridgeAutoStartStatusText)
+    def test_bridge_running_is_true_for_a_live_handle(self):
+        controller = self._make_controller()
+        handle = mock.Mock()
+        handle.is_alive.return_value = True
+        controller._bridge_handle = handle
 
-    def test_set_bridge_auto_start_independent_of_settings_window_toggle(self):
-        """Toggling the bridge MUST NOT call enable/disable for the
-        default RemoteMicRC003 shortcut, and vice versa."""
-        controller, _ = self._make_controller()
-        controller.setBridgeAutoStart(True)
-        # Bridge was toggled.
-        self.fake_enable.assert_called_once()
-        kwargs = self.fake_enable.call_args.kwargs
-        self.assertEqual(
-            kwargs.get("name"),
-            self._real_sc._BRIDGE_STARTUP_FOLDER_NAME,
-        )
-        self.fake_disable.reset_mock()
-        # Default shortcut must NOT have been touched.
-        for call in self.fake_disable.call_args_list:
-            self.assertNotEqual(
-                call.kwargs.get("name"),
-                self._real_sc._BRIDGE_STARTUP_FOLDER_NAME,
-            )
-        # And vice versa: a settings-window toggle must not touch the
-        # bridge shortcut.
-        controller._start_with_windows = False
-        self.fake_enable.reset_mock()
-        self.fake_disable.reset_mock()
-        controller.setStartWithWindows(True)
-        # All enable() / disable() calls for the default name MUST
-        # use the default name, NOT the bridge name.
-        for call in self.fake_enable.call_args_list:
-            self.assertNotEqual(
-                call.kwargs.get("name"),
-                self._real_sc._BRIDGE_STARTUP_FOLDER_NAME,
-            )
-        for call in self.fake_disable.call_args_list:
-            self.assertNotEqual(
-                call.kwargs.get("name"),
-                self._real_sc._BRIDGE_STARTUP_FOLDER_NAME,
-            )
+        self.assertTrue(controller.bridgeRunning)
+        # A live handle must be left exactly where it is.
+        self.assertIs(controller._bridge_handle, handle)
 
-    def test_set_bridge_auto_start_slot_accepts_bool_argument(self):
-        """Round-1 root-cause regression guard: ``setBridgeAutoStart``
-        must be callable with a Python ``bool`` and reach the
-        controller's setter. If the @Slot decorator ever drops the
-        ``(bool)`` annotation, PySide6 will swallow the argument and
-        this test's call to ``setBridgeAutoStart(True)`` would be a
-        no-op - the asserts below would then fail because
-        ``fake_enable`` was never called.
+    def test_bridge_running_is_false_for_a_dead_handle_and_clears_it(self):
+        """A bridge that died on its own must flip the QML property back.
+
+        Nothing else notices a bridge that exits by itself, so if this property
+        kept reporting True the window would offer a "stop" button for a
+        process that is already gone. The dead handle is also dropped from the
+        module registry, which is what ``stopBridge`` and the atexit hook read.
         """
-        controller, _ = self._make_controller()
-        result = controller.setBridgeAutoStart(True)
-        self.assertIsNone(result)
-        self.fake_enable.assert_called_once()
+
+        controller = self._make_controller()
+        handle = mock.Mock()
+        handle.is_alive.return_value = False
+        controller._bridge_handle = handle
+        qt_settings_app._bridge_handle_global = handle
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertIsNone(controller._bridge_handle)
+        self.assertIsNone(
+            qt_settings_app._bridge_handle_global,
+            "the dead handle is still registered - the atexit hook would try "
+            "to stop a process that is already gone",
+        )
+
+    # -- the background autostart status read ------------------------------
+
+    def test_a_second_refresh_while_one_is_in_flight_is_a_no_op(self):
+        """One query at a time.
+
+        Asking Task Scheduler spawns ``powershell.exe`` and costs ~1.2 s, and
+        the window asks for the state on every show, so overlapping queries
+        would pile up processes. A call while one is already running must do
+        nothing at all.
+        """
+
+        controller = self._make_controller()
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def blocking_get_state_dict():
+            calls.append(1)
+            started.set()
+            release.wait(5.0)
+            return {"status_text": "on", "is_error": False, "enabled": True}
+
+        with mock.patch.object(
+            qt_settings_app.elevated_autostart,
+            "get_state_dict",
+            side_effect=blocking_get_state_dict,
+        ):
+            controller._refresh_start_with_windows_status()
+            self.assertTrue(started.wait(5.0), "the first refresh never started")
+
+            # Both entry points, while the first query is still blocked.
+            controller._refresh_start_with_windows_status()
+            controller.refreshStartWithWindowsStatus()
+
+            release.set()
+            self.assertTrue(
+                _pump_until(lambda: not controller._autostart_query_in_flight),
+                "the in-flight guard was never released",
+            )
+
+        self.assertEqual(
+            len(calls), 1, "a second Task Scheduler query was started"
+        )
+
+    def test_status_refresh_keeps_the_switch_put_when_the_state_is_unreadable(self):
+        """Never invent a state we could not observe.
+
+        When the query fails there is no ``enabled`` answer, and the switch must
+        stay exactly where it was - only the status line reports the failure.
+        Flipping it to False would tell the user autostart is off when we simply
+        do not know, and the next save would then write that guess to disk.
+        """
+
+        controller = self._make_controller()
+        controller._start_with_windows = True
+
+        with mock.patch.object(
+            qt_settings_app.elevated_autostart,
+            "get_state_dict",
+            side_effect=RuntimeError("Task Scheduler is unreachable"),
+        ):
+            # assertLogs also swallows the traceback the worker logs, so the
+            # failure is asserted rather than merely printed.
+            with self.assertLogs("ovb_rc003.qt_settings_app", level="ERROR"):
+                controller._refresh_start_with_windows_status()
+                self.assertTrue(
+                    _pump_until(lambda: not controller._autostart_query_in_flight),
+                    "the refresh never reported back",
+                )
+
+        self.assertTrue(
+            controller.startWithWindows,
+            "the switch was moved on a state that could not be read",
+        )
+        self.assertTrue(controller.startWithWindowsStatusIsError)
+        self.assertTrue(controller.startWithWindowsStatusText)
+
+        # Control: a state we CAN read does move the switch, so the assertion
+        # above is about the unreadable case and not about the slot being inert.
+        controller._on_autostart_state_ready("已关闭", False, False)
+        self.assertFalse(controller.startWithWindows)
+
+    def test_status_refresh_does_not_call_a_missing_tray_method(self):
+        """Every tray method the controller reaches for must exist.
+
+        The status refresh used to call a tray helper that had been removed
+        (``set_shortcut_active``). The AttributeError was swallowed and
+        surfaced only as a status line, so the window looked healthy while the
+        tray integration was dead. This checks every
+        ``self._tray_controller.<name>`` reference against the real class, then
+        drives the refresh for real.
+        """
+
+        referenced = set(_TRAY_METHOD_REFERENCE.findall(_qt_settings_source()))
+        self.assertTrue(
+            referenced, "the tray-reference scan found nothing - it cannot fail"
+        )
+        missing = sorted(
+            name for name in referenced if not hasattr(tray_icon.TrayController, name)
+        )
+        self.assertEqual(
+            missing,
+            [],
+            "SettingsController calls tray methods TrayController does not "
+            f"have: {missing}",
+        )
+
+        controller = self._make_controller()
+        with mock.patch.object(
+            qt_settings_app.elevated_autostart,
+            "get_state_dict",
+            return_value={
+                "status_text": "开机自启动已启用。",
+                "is_error": False,
+                "enabled": True,
+            },
+        ):
+            controller._refresh_start_with_windows_status()
+            self.assertTrue(
+                _pump_until(lambda: not controller._autostart_query_in_flight),
+                "the refresh never reported back",
+            )
+
+        self.assertFalse(controller.startWithWindowsStatusIsError)
+        self.assertTrue(controller.startWithWindows)
+
+    def test_tray_controller_has_no_set_shortcut_active(self):
+        """``set_shortcut_active`` was removed from the tray and must stay gone.
+
+        Asserting its absence is what makes the check above a live guard rather
+        than a description of the current code: if the method were restored
+        without also restoring its call site (or vice versa) this fails instead
+        of the mismatch hiding behind a swallowed AttributeError.
+        """
+
+        self.assertFalse(
+            hasattr(tray_icon.TrayController, "set_shortcut_active"),
+            "set_shortcut_active is back on TrayController - either wire it up "
+            "properly or remove it again, but do not leave it half-restored",
+        )
+        self.assertNotIn(
+            "set_shortcut_active",
+            _qt_settings_source(),
+            "the controller references a tray method that no longer exists",
+        )
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
@@ -887,7 +920,7 @@ class OpenLogFileControllerTests(unittest.TestCase):
     (not ``open_log_location``) and surface the result via the
     controller's status-message property.
 
-    Sits next to ``BridgeAutoStartControllerTests`` but uses a simpler
+    Sits next to the diagnostics controller tests but uses a simpler
     headless setup (no QGuiApplication needed - the controller is
     constructed and the slot is invoked directly).
     """
@@ -976,8 +1009,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
         self.Model = classes["ButtonMappingModel"]
         self.SettingsController = classes["SettingsController"]
         self.DiagnosticsController = classes["DiagnosticsController"]
-        QGuiApplication = classes["QGuiApplication"]
-        self.app = QGuiApplication.instance() or QGuiApplication([])
+        self.app = qt_app.get_application()
         self._tmpdir = tempfile.TemporaryDirectory()
         self._env_patch = mock.patch.dict(os.environ, {"LOCALAPPDATA": self._tmpdir.name})
         self._env_patch.start()
@@ -1428,6 +1460,13 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
             def instance():
                 return None
 
+            @staticmethod
+            def setStyle(name):
+                # run_settings_window() calls app.setStyle("Fusion") whenever
+                # the app it built is a real QApplication - which this fake is
+                # from its own point of view, so the call must be absorbed.
+                pass
+
             def exec(self):
                 return exec_return
 
@@ -1442,6 +1481,13 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
                 return path
 
         fake_classes = dict(real_classes)
+        # BOTH application keys must be faked. run_settings_window() reads
+        # classes["QApplication"] to build the app (it needs QtWidgets for the
+        # tray's QMenu/QSystemTrayIcon) and only reaches for QGuiApplication
+        # elsewhere. Faking the latter alone leaves the REAL QApplication in
+        # place, so app.exec() enters a real Qt event loop and this test blocks
+        # forever - 0% CPU, no child process, no failure, no report.
+        fake_classes["QApplication"] = _FakeApp
         fake_classes["QGuiApplication"] = _FakeApp
         fake_classes["QQmlApplicationEngine"] = _FakeEngine
         fake_classes["QQuickStyle"] = _FakeQQuickStyle
@@ -1622,12 +1668,13 @@ tab_bar = find_child(window, "tabBar")
 assert tab_bar is not None
 # Tab order is now 通用/连接/按键映射/权限/检查与修复 (GeneralPage was added
 # as index 0), so the 按键映射 tab lives at index 2. Probe by objectName
-# instead of positional index so the test survives future re-orders.
+# instead of positional index so the test survives future re-orders - there is
+# deliberately no index-based fallback, since a stale index here silently
+# selects the wrong page and makes the probe assert about the wrong widgets
+# (see tests/test_ui_probe_stable_selectors.py).
 mapping_tab_button = find_child(window, "mappingTabButton")
-if mapping_tab_button is not None:
-    mapping_tab_button.setProperty("checked", True)
-else:
-    tab_bar.setProperty("currentIndex", 2)
+assert mapping_tab_button is not None, "mappingTabButton not found"
+mapping_tab_button.setProperty("checked", True)
 for _ in range(10):
     window.grabWindow()
     app.processEvents()
@@ -1829,11 +1876,19 @@ for _ in range(10):
     window.grabWindow()
     app.processEvents()
 
-# Switch to the "按键" tab (index 1) - the ComboBox under test only exists
-# once ButtonsPage is the active StackLayout page.
+# Switch to the "按键" tab - the ComboBox under test only exists once
+# ButtonsPage is the active StackLayout page. Drive the tab by its
+# objectName instead of a positional index: the General tab was inserted at
+# index 0 after this probe was written, which shifted the mapping page from
+# index 1 to 2. With the stale index the probe silently selected the
+# Connection page, found the ComboBox on an inactive StackLayout page, and
+# the real click below landed on the window's content control - surfacing as
+# "click did not focus the ComboBox" ~20 lines further down.
 tab_bar = _find_child_by_object_name(window, "tabBar")
 assert tab_bar is not None
-tab_bar.setProperty("currentIndex", 1)
+mapping_tab_button = _find_child_by_object_name(tab_bar, "mappingTabButton")
+assert mapping_tab_button is not None, "mappingTabButton not found in the tab bar"
+mapping_tab_button.setProperty("checked", True)
 for _ in range(10):
     window.grabWindow()
     app.processEvents()
@@ -1842,6 +1897,13 @@ mapping_list = _find_child_by_object_name(window, "mappingList")
 assert mapping_list is not None
 combo = _find_mapping_row_combo(mapping_list, "power", model)
 assert combo is not None, "power row's ComboBox not found - is it in view?"
+# Precondition, checked before the click so a page-selection regression fails
+# here with an accurate message instead of as a focus assertion later: an
+# inactive StackLayout page leaves its ComboBox present but invisible.
+assert combo.property("visible"), (
+    "the mapping page is not the active StackLayout page - the ComboBox "
+    "exists but is not visible, so a real click cannot reach it"
+)
 
 # Real mouse click into the ComboBox's editable text area -
 # forceActiveFocus() on the ComboBox item alone is NOT equivalent (proven
@@ -1886,6 +1948,335 @@ app.processEvents()
 assert controller.errorMessage == "", f"save reported a validation error: {controller.errorMessage}"
 print("OK")
 """
+
+
+# -- QML / controller contract helpers ------------------------------------
+#
+# The .qml files are the only specification of which SettingsController
+# members and which design tokens have to exist: QML is what Qt binds against
+# at load time, and a name that is not there is not a load failure - it is an
+# "Unable to assign [undefined]" warning and a control that renders blank and
+# silently does nothing. Reading the QML the way Qt does means comments must
+# not count: the removed bridge-autostart card is still *described* in a
+# comment in GeneralPage.qml, and treating that prose as a binding would
+# resurrect a control that no longer exists.
+
+_QML_CONTROLLER_MEMBER = re.compile(r"SettingsController\.([A-Za-z_][A-Za-z0-9_]*)")
+_QML_TOKEN_MEMBER = re.compile(r"\btokens\.([A-Za-z_][A-Za-z0-9_]*)")
+_QML_DECLARED_PROPERTY = re.compile(
+    r"\bproperty\s+[A-Za-z_][A-Za-z0-9_.<>]*\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+_TRAY_METHOD_REFERENCE = re.compile(r"self\._tray_controller\.([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _strip_qml_comments(source: str) -> str:
+    """Remove ``//`` and ``/* */`` comments, leaving string literals intact.
+
+    Both directions matter. A name inside a comment is not a binding, so
+    leaving comments in invents requirements; and a literal like
+    ``"https://example.invalid//path"`` contains a ``//`` that is not a
+    comment, so stripping naively corrupts real source. QML strings use single
+    or double quotes with backslash escapes, which is all this has to track.
+    """
+
+    out: list = []
+    index = 0
+    length = len(source)
+    while index < length:
+        char = source[index]
+        if char in "\"'":
+            quote = char
+            out.append(char)
+            index += 1
+            while index < length:
+                out.append(source[index])
+                if source[index] == "\\" and index + 1 < length:
+                    out.append(source[index + 1])
+                    index += 2
+                    continue
+                if source[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        if char == "/" and index + 1 < length and source[index + 1] == "/":
+            while index < length and source[index] != "\n":
+                index += 1
+            continue
+        if char == "/" and index + 1 < length and source[index + 1] == "*":
+            index += 2
+            while index + 1 < length and not (
+                source[index] == "*" and source[index + 1] == "/"
+            ):
+                index += 1
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _qml_sources() -> dict:
+    """Every shipped .qml file, keyed by file name, read through the same
+    frozen-vs-checkout lookup the app itself uses."""
+
+    directory = qt_settings_app._qml_directory()
+    return {
+        path.name: path.read_text(encoding="utf-8")
+        for path in sorted(Path(directory).glob("*.qml"))
+    }
+
+
+def _qml_controller_members() -> set:
+    members: set = set()
+    for source in _qml_sources().values():
+        members.update(_QML_CONTROLLER_MEMBER.findall(_strip_qml_comments(source)))
+    return members
+
+
+def _qml_token_members() -> set:
+    members: set = set()
+    for name, source in _qml_sources().items():
+        if name == "Tokens.qml":
+            continue
+        members.update(_QML_TOKEN_MEMBER.findall(_strip_qml_comments(source)))
+    return members
+
+
+def _qt_settings_source() -> str:
+    return Path(qt_settings_app.__file__).read_text(encoding="utf-8")
+
+
+def _pump_until(predicate, timeout: float = 5.0) -> bool:
+    """Wait for ``predicate`` while delivering queued Qt signals.
+
+    ``SettingsController`` hands background results back through a signal, and
+    a signal emitted from a worker thread is delivered as a *queued* call on
+    the receiver's thread. A plain sleep loop therefore never sees the result:
+    the slot that clears the in-flight guard only runs when the event queue is
+    processed.
+    """
+
+    application = qt_app.get_application()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        application.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.005)
+    application.processEvents()
+    return predicate()
+
+
+def _settings_controller_slots() -> dict:
+    """``{slot_name: line_number}`` for every @Slot-decorated
+    ``SettingsController`` method, read from the source rather than from the
+    live class so the check also covers a slot that fails to build."""
+
+    tree = ast.parse(_qt_settings_source())
+    slots: dict = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or node.name != "SettingsController":
+            continue
+        for item in node.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in item.decorator_list:
+                target = decorator.func if isinstance(decorator, ast.Call) else decorator
+                if getattr(target, "id", None) == "Slot":
+                    slots[item.name] = item.lineno
+    return slots
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class OrphanedControllerSlotRegressionTests(unittest.TestCase):
+    """A slot nothing can reach is worse than a missing one: it looks like a
+    feature and behaves like a no-op. These two tests walk the two
+    reachability directions the settings window actually uses - signals into
+    slots, and QML into the controller - and fail on an orphan either way.
+    """
+
+    def test_every_tray_signal_is_connected_by_the_controller(self):
+        """Every signal ``TrayController`` declares must be wired up.
+
+        The tray menu is the only way the icon can reach the app, and the
+        wiring is a hand-written list of ``connect`` calls, so a signal added
+        to the tray is silently dead until someone remembers to add the
+        matching line here. Connectivity is read from Qt's own receiver count
+        rather than from the source text, so a ``connect`` to something that
+        is not a slot cannot pass.
+
+        Note: the signature handed to ``receivers()`` is spelled for a
+        zero-argument signal, which is what both tray signals are. A future
+        signal that takes arguments would need its signature spelled out here
+        - it would fail loudly rather than pass quietly.
+        """
+
+        classes = qt_settings_app._load_qt_classes()
+        qt_app.get_application()
+
+        declared = [
+            name
+            for name, value in vars(tray_icon.TrayController).items()
+            if isinstance(value, tray_icon.Signal)
+        ]
+        self.assertTrue(declared, "TrayController declares no signals to check")
+
+        # A stand-in carrying the real signal set but skipping the parts that
+        # need a live system tray (QMenu/QSystemTrayIcon). The controller's
+        # wiring path is untouched: it only ever calls show()/hide()/
+        # set_window_visible() on whatever it is handed.
+        class _StandInTray(tray_icon.TrayController):
+            def __init__(self, **kwargs):
+                tray_icon.QObject.__init__(self)
+                self.show_calls = 0
+
+            def show(self):
+                self.show_calls += 1
+                return False  # "no usable system tray" - the graceful path
+
+            def hide(self):
+                return None
+
+            def set_window_visible(self, visible):
+                return None
+
+        created: list = []
+
+        def _factory(**kwargs):
+            instance = _StandInTray(**kwargs)
+            created.append(instance)
+            return instance
+
+        model = classes["ButtonMappingModel"]()
+        controller = classes["SettingsController"](model)
+        controller._tray_enabled = True
+        with mock.patch.object(tray_icon, "TrayController", _factory):
+            controller._apply_tray_to_runtime()
+
+        self.assertEqual(len(created), 1, "the tray controller was never built")
+        tray = created[0]
+        self.assertEqual(tray.show_calls, 1)
+        unconnected = [name for name in declared if tray.receivers(f"2{name}()") < 1]
+        self.assertEqual(
+            unconnected,
+            [],
+            "TrayController signal(s) declared but never connected by "
+            f"SettingsController, so the menu item does nothing: {unconnected}",
+        )
+
+    def test_no_controller_slot_is_orphaned(self):
+        """Every @Slot on SettingsController must be reachable from somewhere.
+
+        Reachable means one of: named by QML, mentioned anywhere else in the
+        module (a ``connect`` target or a call from DiagnosticsController both
+        count), or listed below as deliberately-retained public API.
+        """
+
+        slots = _settings_controller_slots()
+        self.assertTrue(slots, "the @Slot scan found nothing - it cannot fail")
+
+        source = _qt_settings_source()
+        qml_members = _qml_controller_members()
+        self.assertTrue(qml_members, "no SettingsController members found in QML")
+
+        # ``refreshStartWithWindowsStatus`` is public API kept for QML to call
+        # on window show, "in case the shortcut was removed out-of-band" (see
+        # its docstring). No QML calls it today and it is deliberately not
+        # removed - this is that one documented exception, not a blanket
+        # allowance for unused slots.
+        retained_public_api = {"refreshStartWithWindowsStatus"}
+
+        orphans = []
+        for name, lineno in sorted(slots.items(), key=lambda item: item[1]):
+            if name in qml_members or name in retained_public_api:
+                continue
+            word = rf"\b{re.escape(name)}\b"
+            mentions = len(re.findall(word, source))
+            definitions = len(re.findall(rf"\bdef\s+{re.escape(name)}\b", source))
+            if mentions > definitions:
+                continue
+            orphans.append(f"{name} (line {lineno})")
+
+        self.assertEqual(
+            orphans,
+            [],
+            "SettingsController slot(s) nothing can reach: " + ", ".join(orphans),
+        )
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class QmlControllerContractTests(unittest.TestCase):
+    """The QML files are the contract; the controller has to satisfy it.
+
+    Qt resolves ``SettingsController.<member>`` and ``tokens.<member>`` when it
+    loads the QML. A name that is not there is not a load failure - it is an
+    "Unable to assign [undefined] to ..." warning plus a control that renders
+    blank and does nothing, which is exactly how the removed bridge-autostart
+    card survived a release.
+    """
+
+    def test_the_comment_stripper_ignores_comments_but_keeps_strings(self):
+        """Guard on the guard: both failure directions of the stripper.
+
+        Too little stripping invents requirements out of prose; too much
+        corrupts string literals that legitimately contain ``//``.
+        """
+
+        source = (
+            "a: 1 // SettingsController.removedOne\n"
+            'b: "https://example.invalid//path" + "SettingsController.keptOne"\n'
+            "c: 2 /* SettingsController.removedTwo */\n"
+        )
+        stripped = _strip_qml_comments(source)
+        self.assertNotIn("SettingsController.removedOne", stripped)
+        self.assertNotIn("SettingsController.removedTwo", stripped)
+        self.assertIn("SettingsController.keptOne", stripped)
+        self.assertIn("https://example.invalid//path", stripped)
+
+    def test_the_scan_actually_finds_the_qml_sources(self):
+        """A scan that finds nothing must not read as "nothing wrong"."""
+
+        sources = _qml_sources()
+        self.assertGreaterEqual(len(sources), 5, sorted(sources))
+        for expected in ("main.qml", "Tokens.qml", "GeneralPage.qml", "ButtonsPage.qml"):
+            self.assertIn(expected, sources)
+
+        members = _qml_controller_members()
+        self.assertGreaterEqual(len(members), 20, sorted(members))
+        self.assertIn("saveSettings", members)
+
+    def test_every_settings_controller_member_named_by_qml_exists(self):
+        classes = qt_settings_app._load_qt_classes()
+        Controller = classes["SettingsController"]
+
+        members = _qml_controller_members()
+        self.assertTrue(members, "no SettingsController members found in the QML")
+
+        missing = sorted(name for name in members if not hasattr(Controller, name))
+        self.assertEqual(
+            missing,
+            [],
+            "QML binds SettingsController members the controller never "
+            f"declares - blank controls and silent no-ops: {missing}",
+        )
+
+    def test_every_token_named_by_qml_is_declared_in_tokens_qml(self):
+        sources = _qml_sources()
+        declared = set(
+            _QML_DECLARED_PROPERTY.findall(_strip_qml_comments(sources["Tokens.qml"]))
+        )
+        self.assertTrue(declared, "Tokens.qml declares no properties")
+
+        used = _qml_token_members()
+        self.assertTrue(used, "no tokens.* references found in the QML")
+
+        missing = sorted(name for name in used if name not in declared)
+        self.assertEqual(
+            missing,
+            [],
+            f"QML uses tokens.* that Tokens.qml never declares: {missing}",
+        )
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
@@ -2161,11 +2552,15 @@ for _ in range(10):
     window.grabWindow()
     app.processEvents()
 
-# Switch to the "按键" tab (index 1) so ButtonsPage is the active page and
-# its photo/hotspots actually lay out and paint.
+# Switch to the "按键" tab so ButtonsPage is the active page and its
+# photo/hotspots actually lay out and paint. Selected by objectName rather
+# than a positional index: General is now the leftmost tab, so the mapping
+# page sits at index 2 (same fix as in the direct-save probe above).
 tab_bar = _find(content_item, "tabBar")
 assert tab_bar is not None
-tab_bar.setProperty("currentIndex", 1)
+mapping_tab_button = _find(content_item, "mappingTabButton")
+assert mapping_tab_button is not None, "mappingTabButton not found"
+mapping_tab_button.setProperty("checked", True)
 for _ in range(10):
     window.grabWindow()
     app.processEvents()

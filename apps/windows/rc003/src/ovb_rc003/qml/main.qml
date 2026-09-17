@@ -119,19 +119,19 @@ ApplicationWindow {
         Rectangle {
             Layout.fillWidth: true
             implicitHeight: 22
-            color: tokens.divider
+            color: tokens.border
 
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: tokens.padMedium
-                anchors.rightMargin: tokens.padMedium
+                anchors.leftMargin: tokens.spacingMedium
+                anchors.rightMargin: tokens.spacingMedium
 
                 Item { Layout.fillWidth: true }
 
                 Text {
                     text: qsTr("RemoteMicRC003 v") + SettingsController.version
-                    color: tokens.textMuted
-                    font.pixelSize: tokens.fontSmall
+                    color: tokens.textSecondary
+                    font.pixelSize: tokens.fontSizeSmall
                     Accessible.ignored: true
                 }
             }

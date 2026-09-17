@@ -107,6 +107,7 @@ from . import (
     bridge_launcher,
     config,
     device_catalog,
+    elevated_autostart,
     hotkey,
     hotkey_capture_windows,
     key_mapping,
@@ -116,11 +117,15 @@ from . import (
     resources,
     settings_ui,
     shell_targets,
-    startup_shortcut,
     tray_icon,
     vb_cable_bundle,
     windows_diagnostics,
 )
+
+# ``__version__`` is defined once, in ``ovb_rc003/__init__.py``. Bind it here
+# so the QML-facing ``version`` Property can be declared ``constant=True``
+# rather than re-reading package metadata on every read.
+from . import __version__ as _PACKAGE_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -727,6 +732,14 @@ def _load_qt_classes() -> dict:
         startWithWindowsChanged = Signal()
         startWithWindowsStatusTextChanged = Signal()
         startWithWindowsStatusIsErrorChanged = Signal()
+
+        # Emitted by whichever worker thread finished an autostart query,
+        # carrying ``(status_text, is_error, enabled)``. ``enabled`` is None
+        # when the scheduled-task state could not be read at all, so the
+        # switch keeps its last known position instead of inventing one.
+        # Qt queues this onto the GUI thread automatically, the same
+        # marshal-a-result-back shape the diagnostics worker uses below.
+        _autostartStateReady = Signal(str, bool, object)
         closingBehaviorTextChanged = Signal()
 
         _TRIGGER_MODE_ORDER = tuple(key_mapping.VoiceTriggerMode)
@@ -779,17 +792,25 @@ def _load_qt_classes() -> dict:
             self._tray_controller: Optional["tray_icon.TrayController"] = None
             self._tray_available: bool = False
             self._tray_status_text: str = ""
-            # start-with-Windows state is computed on demand by reading the
-            # Startup folder - it cannot be cached, because another process
-            # (the user, PowerShell, Windows itself) can drop / remove the
-            # shortcut at any time. ``_start_with_windows_status_text``
-            # is set the first time ``apply_runtime`` runs (see below)
-            # and again every time the user toggles the switch.
-            self._start_with_windows: bool = (
-                startup_shortcut.is_enabled()
+            # start-with-Windows state now lives in the elevated scheduled
+            # task ``RemoteMicRC003-Elevated`` rather than in a Startup-folder
+            # shortcut, so reading it costs a ``powershell.exe`` spawn
+            # (~1.2 s measured). It therefore cannot be computed here, on the
+            # GUI thread: ``__init__`` only seeds the "not read yet" text and
+            # the first real read happens later, from ``apply_runtime``, on a
+            # worker thread. The switch keeps its last known position until
+            # that answer arrives - see ``_on_autostart_state_ready`` for the
+            # adopt-the-result side.
+            self._start_with_windows: bool = False
+            self._start_with_windows_status_text: str = (
+                "正在读取开机自启动状态…"
             )
-            self._start_with_windows_status_text: str = ""
             self._start_with_windows_status_is_error: bool = False
+            # Guard + signal for that background read: the flag stops a second
+            # query from starting while one is already in flight.
+
+            self._autostart_query_in_flight = False
+            self._autostartStateReady.connect(self._on_autostart_state_ready)
 
             self._endpoint_options: List[str] = []
             self._selected_endpoint_index = -1
@@ -821,8 +842,10 @@ def _load_qt_classes() -> dict:
               ``show_window_requested`` / ``quit_requested`` signals.
             * Install the window event filter so closing the window
               hides it instead of quitting (when ``_tray_enabled``).
-            * Refresh the start-with-Windows status text now that we have
-              a Qt thread to safely hit the disk.
+            * Refresh the start-with-Windows status text. This only *starts* a
+              background read of the scheduled task; the result arrives later
+              through ``_autostartStateReady``, so the window is never blocked
+              on a PowerShell spawn.
             """
             if getattr(self, "_runtime_applied", False):
                 return
@@ -968,39 +991,103 @@ def _load_qt_classes() -> dict:
                         "tray: set_window_visible(True) failed"
                     )
 
+        _AUTOSTART_UNREADABLE_TEXT = (
+            "无法读取开机自启动状态。"
+        )
+
         def _refresh_start_with_windows_status(self) -> None:
-            """Re-read ``startup_shortcut.is_enabled`` and update the
-            status text + is_error flag. Cheap; safe to call any time."""
-            new_state = bool(startup_shortcut.is_enabled())
+            """Start a background read of the elevated task's state.
+
+            This is no longer a direct read. It used to be a filesystem check
+            on the Startup folder, but the state now lives in the scheduled task
+            ``RemoteMicRC003-Elevated``, and asking Task Scheduler costs ~1.2 s
+            (it spawns ``powershell.exe``). Every caller here runs on the GUI
+            thread, so the query goes to a plain ``threading.Thread`` and the
+            answer returns through ``_autostartStateReady`` - the same
+            marshal-a-background-result-back-via-a-queued-signal shape the
+            DiagnosticsController worker uses. Cheap and safe to call any time;
+            a call while a query is already in flight is a no-op.
+            """
+            if self._autostart_query_in_flight:
+                return
+            self._autostart_query_in_flight = True
+
+            def _run_in_background() -> None:
+                try:
+                    info = elevated_autostart.get_state_dict()
+                except Exception:  # noqa: BLE001
+                    logger.exception("autostart: state query failed")
+                    info = None
+                self._emit_autostart_state(info)
+
+            thread = threading.Thread(target=_run_in_background, daemon=True)
+            thread.start()
+
+        def _emit_autostart_state(self, info) -> None:
+            """Emit one autostart result onto the GUI thread. Worker-side.
+
+            ``info`` is ``elevated_autostart.get_state_dict()`` or None when the
+            query failed. Emitting is wrapped because the Qt runtime may already
+            be tearing down by the time a worker finishes.
+            """
+            if not info:
+                payload = (self._AUTOSTART_UNREADABLE_TEXT, True, None)
+            else:
+                payload = (
+                    str(info.get("status_text", "")),
+                    bool(info.get("is_error", False)),
+                    bool(info.get("enabled", False)),
+                )
+            try:
+                self._autostartStateReady.emit(*payload)
+            except Exception:  # noqa: BLE001
+                logger.exception("autostart: emit failed")
+
+        @Slot(str, bool, object)
+        def _on_autostart_state_ready(self, status_text: str, is_error: bool, enabled) -> None:
+            """GUI-thread slot: adopt a background result.
+
+            ``enabled`` is True/False when the state could be read, and None
+            when it could not - in which case the switch keeps its previous
+            position and only the status line reports the failure, rather than
+            inventing a state we could not observe. That mirrors the fail-closed
+            choice ``elevated_autostart`` makes internally.
+            """
+
+            # Clear the guard first: the query this answers is finished.
+            self._autostart_query_in_flight = False
+
+            if enabled is None:
+                self._start_with_windows_status_text = (
+                    status_text or self._AUTOSTART_UNREADABLE_TEXT
+                )
+                self._start_with_windows_status_is_error = True
+                self.startWithWindowsStatusTextChanged.emit()
+                self.startWithWindowsStatusIsErrorChanged.emit()
+                return
+
+            new_state = bool(enabled)
             changed = new_state != self._start_with_windows
             self._start_with_windows = new_state
-            if new_state:
-                self._start_with_windows_status_text = (
-                    "\u5df2\u52a0\u5165\u5f00\u673a\u542f\u52a8\u3002\u4e0b\u6b21\u767b\u5f55 Windows "
-                    "\u4f1a\u81ea\u52a8\u6253\u5f00\u8bbe\u7f6e\u7a97\u53e3\u3002"
-                )
-                self._start_with_windows_status_is_error = False
-            else:
-                self._start_with_windows_status_text = (
-                    "\u672a\u52a0\u5165\u5f00\u673a\u542f\u52a8\u3002\u6253\u5f00\u540e\u4e0b\u6b21\u767b\u5f55\u4f1a\u81ea\u52a8\u52a0\u8f7d\u3002"
-                )
-                self._start_with_windows_status_is_error = False
+            self._start_with_windows_status_text = status_text
+            self._start_with_windows_status_is_error = bool(is_error)
             if changed:
                 self.startWithWindowsChanged.emit()
             self.startWithWindowsStatusTextChanged.emit()
             self.startWithWindowsStatusIsErrorChanged.emit()
-            # Keep the tray's "Open Startup folder" menu item in sync
-            # with reality. No-op if the tray has not been
-            # constructed yet (apply_runtime hasn't run).
-            if self._tray_controller is not None:
-                try:
-                    self._tray_controller.set_shortcut_active(new_state)
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "tray: set_shortcut_active sync failed"
-                    )
 
         # -- properties (tray + start-with-Windows) ---------------------------
+
+        # The two ``startWithWindows*`` properties below are read-only views of
+        # state that only a background query can produce: nothing in this class
+        # assigns ``_start_with_windows`` except ``_on_autostart_state_ready``.
+        # Writes go through ``_set_start_with_windows``, which hands the work to
+        # a worker thread and reports back the same way. There is deliberately
+        # no synchronous "read the task now" path left - the old one blocked the
+        # GUI thread for ~1.2 s per call, and ``apply_runtime`` reaches it on
+        # every window construction.
+        #
+        # ``_autostart_query_in_flight`` guards both directions.
 
         def _get_tray_enabled(self) -> bool:
             return self._tray_enabled
@@ -1024,46 +1111,95 @@ def _load_qt_classes() -> dict:
             return self._start_with_windows
 
         def _set_start_with_windows(self, value: bool) -> None:
+            """Enable or disable the elevated at-logon scheduled task.
+
+            Replaces the old Startup-folder path. That one wrote a per-user
+            ``.lnk`` which Windows will not let raise its own token, so turning
+            it *on* produced a bridge whose Vol+ / Vol- / Back were dead - the
+            toggle was wired to the wrong mechanism. The scheduled task is
+            started by the Task Scheduler service, so it runs with
+            ``RunLevel=Highest`` and no prompt, and the Frida tap can attach.
+
+            Enabling may need a one-time registration: ``Register-ScheduledTask``
+            with a Highest-privilege principal is itself privileged. When that is
+            refused, the message says so ("run once as administrator") instead of
+            surfacing a raw PowerShell error.
+
+            Runs on a worker thread: every step here reads or writes the task,
+            and each of those spawns ``powershell.exe`` (~1.2 s measured), so
+            doing it inline would freeze the window on every click.
+            """
             target = bool(value)
-            if target == self._start_with_windows and target == bool(
-                startup_shortcut.is_enabled()
-            ):
+            if self._autostart_query_in_flight:
                 return
-            try:
-                if target:
-                    target_exe = self._resolve_autostart_target()
-                    if target_exe is None:
-                        self._start_with_windows_status_text = (
-                            "\u542f\u52a8\u9879\u5931\u8d25: \u672a\u80fd\u5b9a\u4f4d\u53ef\u6267\u884c\u6587\u4ef6\u3002"
-                        )
-                        self._start_with_windows_status_is_error = True
-                        self.startWithWindowsStatusTextChanged.emit()
-                        self.startWithWindowsStatusIsErrorChanged.emit()
+            self._autostart_query_in_flight = True
+
+            def _run_in_background() -> None:
+                outcome = elevated_autostart.ElevatedAutostartOutcome
+                try:
+                    if target and not elevated_autostart.is_registered():
+                        target_exe = self._resolve_autostart_target()
+                        if target_exe is None:
+                            try:
+                                self._autostartStateReady.emit(
+                                    "启动项失败: 未能定位可执行文件。",
+                                    # is_error
+                                    True,
+                                    None,
+                                )
+                            except Exception:  # noqa: BLE001
+                                logger.exception("autostart: emit failed")
+                            return
+                        registered = elevated_autostart.register(target_exe)
+                        if registered.outcome != outcome.REGISTERED:
+                            try:
+                                self._autostartStateReady.emit(
+                                    registered.message, True, None
+                                )
+                            except Exception:  # noqa: BLE001
+                                logger.exception("autostart: emit failed")
+                            return
+
+                    result = elevated_autostart.set_enabled(target)
+                    is_error = result.outcome == outcome.FAILED
+                    if is_error:
+                        try:
+                            self._autostartStateReady.emit(result.message, True, None)
+                        except Exception:  # noqa: BLE001
+                            logger.exception("autostart: emit failed")
                         return
-                    result = startup_shortcut.enable(target_exe)
-                else:
-                    result = startup_shortcut.disable()
-            except Exception as exc:  # noqa: BLE001
-                self._start_with_windows_status_text = (
-                    f"\u542f\u52a8\u9879\u51fa\u9519: {exc}"
-                )
-                self._start_with_windows_status_is_error = True
-                self.startWithWindowsStatusTextChanged.emit()
-                self.startWithWindowsStatusIsErrorChanged.emit()
-                return
-            if result.outcome == startup_shortcut.StartupShortcutOutcome.FAILED:
-                self._start_with_windows_status_text = result.message
-                self._start_with_windows_status_is_error = True
-            else:
-                self._start_with_windows_status_text = result.message
-                self._start_with_windows_status_is_error = False
-            self._refresh_start_with_windows_status()
+                    # Re-read rather than assuming: ``set_enabled`` may have had to
+                    # register the task first, and the authoritative "is it on" answer
+                    # is whatever the Task Scheduler reports now, not the outcome code
+                    # we just got back.
+                    info = elevated_autostart.get_state_dict()
+                    try:
+                        self._autostartStateReady.emit(
+                            result.message,
+                            False,
+                            bool(info.get("enabled", False)),
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("autostart: emit failed")
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("autostart: toggle failed")
+                    try:
+                        self._autostartStateReady.emit(
+                            f"启动项出错: {exc}", True, None
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("autostart: emit failed")
+
+            thread = threading.Thread(target=_run_in_background, daemon=True)
+            thread.start()
 
         @staticmethod
         def _resolve_autostart_target() -> Optional[Path]:
-            """Return the executable path that should be placed in the
-            Startup folder. ``None`` means we cannot autostart from
-            here (e.g. running tests or a misconfigured install).
+            """Return the executable the scheduled task should launch.
+
+            Used only by the one-time registration path (the task must already
+            exist for a plain enable/disable). ``None`` means we cannot register
+            from here (e.g. running tests, or a misconfigured install).
             """
             # Frozen build (PyInstaller sets ``sys.frozen``): the running
             # ``sys.executable`` is the .exe itself and is the only
@@ -1109,6 +1245,13 @@ def _load_qt_classes() -> dict:
                 "\u5173\u95ed\u4f1a\u9690\u85cf\u5230\u6258\u76d8\u3002"
             )
 
+        def _get_version(self) -> str:
+            """Package version, for main.qml's footer label.
+
+            Fixed at import time, hence ``constant=True`` on the Property.
+            """
+            return _PACKAGE_VERSION
+
         @Slot()
         def setTrayEnabled(self, value: bool) -> None:  # noqa: N802 (QML slot)
             self._set_tray_enabled(value)
@@ -1152,6 +1295,14 @@ def _load_qt_classes() -> dict:
         closingBehaviorText = Property(
             str, _get_closing_behavior_text, notify=closingBehaviorTextChanged
         )
+
+        # Read-only and fixed at import time, so QML can bind it without a
+        # notify signal (``constant=True``). main.qml shows this in the footer
+        # next to the build stamp; it is the same string that
+        # ``ovb_rc003/__init__`` exports as ``__version__``, so there is
+        # exactly one place to bump on release, and the QML side can never
+        # disagree with the packaging metadata.
+        version = Property(str, _get_version, constant=True)
 
         # -- internal helpers -------------------------------------------------
 
@@ -1433,7 +1584,12 @@ def _load_qt_classes() -> dict:
             handle = self._bridge_handle
             if handle is None:
                 return False
-            if not handle.process.is_alive():
+            # ``is_alive()`` (not ``handle.process.is_alive()``): the handle
+            # owns the liveness question, so the GUI thread never has to reach
+            # through it to a ``subprocess.Popen`` that a background thread may
+            # be replacing at the same moment. A dead handle is dropped here so
+            # the QML property flips back to false on its own.
+            if not handle.is_alive():
                 self._bridge_handle = None
                 clear_bridge_handle()
                 return False
@@ -1738,6 +1894,26 @@ def _load_qt_classes() -> dict:
         @Slot()
         def openLogLocation(self) -> None:
             result = logging_setup.open_log_location()
+            self._set_status_message(settings_ui.describe_log_open_result(result))
+
+        @Slot()
+        def openLogFile(self) -> None:
+            """Open ``app.log`` itself, not the folder that holds it.
+
+            The one-step "view log" button. ``DiagnosticsPage.qml`` has
+            called ``SettingsController.openLogFile()`` since the button
+            was added, but no such slot existed on this class, so the
+            click was silently a no-op (QML only reports an unknown
+            member at click time, which is why the zero-warnings load
+            gate never caught it).
+
+            Deliberately a separate slot from ``openLogLocation`` rather
+            than a parameterised one: the two have different failure
+            contracts. ``open_log_file`` reports ``FILE_MISSING`` when
+            ``app.log`` does not exist yet instead of quietly falling
+            back to the directory, and the UI must be able to say so.
+            """
+            result = logging_setup.open_log_file()
             self._set_status_message(settings_ui.describe_log_open_result(result))
 
         @Slot(str)

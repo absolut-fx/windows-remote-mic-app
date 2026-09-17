@@ -347,21 +347,44 @@ class PublicBoundaryTests(unittest.TestCase):
 class RealPowerShellRoundtripTests(unittest.TestCase):
     """Single end-to-end test: real PowerShell + real Startup folder.
 
-    Skipped on non-Windows hosts. On Windows this writes a real .lnk
-    inside the user's Startup folder then removes it, proving the
-    whole pipeline (PowerShell invocation, WScript.Shell COM, shortcut
-    I/O) is wired correctly. NOT idempotent across reruns - it
-    disables at the end so a CI runner doesn't end up with a permanent
-    autostart entry.
+    OPT-IN, and skipped by default. This test writes a real ``.lnk`` into the
+    developer's own Startup folder and then deletes it again - i.e. it creates
+    a real autostart entry on a real machine. That is not something an
+    uninvited test run should do.
+
+    On 2026-09-16 a run left ``RemoteMicRC003.lnk`` behind in this machine's
+    Startup folder: the harness denied the delete, so both the test's own
+    ``disable()`` call and its ``addCleanup(startup_shortcut.disable)``
+    reported ``FAILED`` and the file stayed. Left there, it would have raced
+    the elevated scheduled task ``RemoteMicRC003-Elevated`` for the
+    single-instance mutex at the next logon, and if the unelevated launcher
+    won the race the Frida HID tap would never attach.
+
+    Set ``OVB_RC003_RUN_STARTUP_FOLDER_TESTS=1`` to run it deliberately, on a
+    host where a transient autostart entry is acceptable. Skips on non-Windows
+    hosts regardless (real PowerShell + WScript.Shell required).
     """
+
+    _OPT_IN_ENV = "OVB_RC003_RUN_STARTUP_FOLDER_TESTS"
 
     def setUp(self) -> None:
         if sys.platform != "win32":
             self.skipTest("real PowerShell + WScript.Shell only on Windows")
+        if os.environ.get(self._OPT_IN_ENV) != "1":
+            self.skipTest(
+                "writes a real .lnk into the developer's Startup folder; set "
+                f"{self._OPT_IN_ENV}=1 to run it deliberately"
+            )
 
     def test_real_powershell_roundtrip_on_windows(self) -> None:
         # Cleanup any stale state from a previous failed run first.
         startup_shortcut.disable()
+        # Register the cleanup BEFORE any assertion. The assertions below
+        # write a real autostart entry into the developer's Startup folder,
+        # so a failure must not skip it -- the trailing disable() alone is
+        # not enough, because an assertion failure exits the test first and
+        # leaves a real RemoteMicRC003.lnk behind.
+        self.addCleanup(startup_shortcut.disable)
 
         # Pick a real exe that exists on this Windows host. The
         # current Python interpreter is always available; if
