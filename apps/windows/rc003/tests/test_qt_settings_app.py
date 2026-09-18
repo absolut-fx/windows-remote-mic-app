@@ -361,9 +361,9 @@ class SettingsControllerTests(unittest.TestCase):
         self._env_patch.stop()
         self._tmpdir.cleanup()
 
-    def _make_controller(self):
+    def _make_controller(self, *, launched_at_logon=False):
         model = self.Model()
-        controller = self.Controller(model)
+        controller = self.Controller(model, launched_at_logon=launched_at_logon)
         return controller, model
 
     def test_hotkey_text_defaults_to_the_configured_default(self):
@@ -484,6 +484,131 @@ class SettingsControllerTests(unittest.TestCase):
             controller.saveAndLaunch()
         self.assertIn("4321", controller.launchStatusText)
         self.assertNotIn("已连接", controller.launchStatusText)
+
+    # -- "close the panel after boot up" ----------------------------------
+
+    class _FakeHideableWindow:
+        """Just enough window for the policy: it records hide() calls."""
+
+        def __init__(self):
+            self.hide_calls = 0
+
+        def hide(self):
+            self.hide_calls += 1
+
+    def _boot_close_decides(
+        self,
+        *,
+        launched_at_logon=True,
+        close_after_boot=True,
+        tray_available=True,
+        bridge_launch_ok=True,
+    ):
+        controller, _ = self._make_controller(launched_at_logon=launched_at_logon)
+        # Private state set directly: these three are normally written by
+        # apply_runtime (tray) and _auto_launch_bridge (launch outcome), and
+        # exercising either here would need a real tray icon and a real child
+        # process. What is under test is the policy, not those two.
+        controller._close_after_boot = close_after_boot
+        controller._tray_enabled = True
+        controller._tray_available = tray_available
+        controller._bridge_launch_ok = bridge_launch_ok
+        window = self._FakeHideableWindow()
+        controller._runtime_window = window
+        controller._apply_close_after_boot_policy()
+        return window.hide_calls
+
+    def test_close_panel_after_boot_defaults_to_off(self):
+        # An option that changes what happens on every boot must be opt-in,
+        # not opt-out.
+        controller, _ = self._make_controller()
+        self.assertFalse(controller.closePanelAfterBoot)
+
+    def test_close_panel_after_boot_survives_a_reload(self):
+        controller, _ = self._make_controller()
+        controller.setClosePanelAfterBoot(True)
+        self.assertTrue(controller.closePanelAfterBoot)
+        self.assertIs(controller._config["close_panel_after_boot"], True)
+        reloaded, _ = self._make_controller()
+        self.assertTrue(reloaded.closePanelAfterBoot)
+
+    def test_boot_close_hides_the_window_for_a_logon_launch(self):
+        self.assertEqual(self._boot_close_decides(), 1)
+
+    def test_boot_close_leaves_a_manually_opened_window_alone(self):
+        # The single most important negative: a user who double-clicks the exe
+        # must get a window that stays, even with the option on.
+        self.assertEqual(self._boot_close_decides(launched_at_logon=False), 0)
+
+    def test_boot_close_leaves_the_window_alone_when_the_option_is_off(self):
+        self.assertEqual(self._boot_close_decides(close_after_boot=False), 0)
+
+    def test_boot_close_leaves_the_window_alone_when_the_host_has_no_tray(self):
+        self.assertEqual(self._boot_close_decides(tray_available=False), 0)
+
+    def test_boot_close_keeps_the_window_when_the_bridge_failed_to_start(self):
+        # The window is the only place that failure is visible.
+        self.assertEqual(self._boot_close_decides(bridge_launch_ok=False), 0)
+
+    def test_boot_close_does_nothing_without_a_window(self):
+        controller, _ = self._make_controller(launched_at_logon=True)
+        controller._close_after_boot = True
+        controller._tray_enabled = True
+        controller._tray_available = True
+        controller._bridge_launch_ok = True
+        # No _runtime_window attribute at all - must return quietly, not raise.
+        controller._apply_close_after_boot_policy()
+
+    def test_a_failed_auto_launch_records_the_failure_for_the_policy(self):
+        controller, _ = self._make_controller()
+        fake_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.QUICK_EXIT,
+            command=("exe",),
+            exit_code=1,
+        )
+        with mock.patch.object(
+            bridge_launcher, "launch_bridge", return_value=fake_result
+        ):
+            controller._auto_launch_bridge()
+        self.assertFalse(controller._bridge_launch_ok)
+
+    def test_an_already_running_bridge_counts_as_a_successful_start(self):
+        # ALREADY_RUNNING means the single-instance guard refused this second
+        # process because the first one owns the bridge - so the remote does
+        # work and the window may still get out of the way.
+        controller, _ = self._make_controller()
+        fake_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
+            command=("exe",),
+            exit_code=1,
+        )
+        with mock.patch.object(
+            bridge_launcher, "launch_bridge", return_value=fake_result
+        ):
+            controller._auto_launch_bridge()
+        self.assertTrue(controller._bridge_launch_ok)
+
+    def test_the_dji_profile_counts_as_ok_because_nothing_was_attempted(self):
+        controller, _ = self._make_controller()
+        controller.selectedDeviceIndex = controller._DEVICE_ORDER.index(
+            device_catalog.DJI_MIC_2_ID
+        )
+        with mock.patch.object(bridge_launcher, "launch_bridge") as fake_launch:
+            controller._auto_launch_bridge()
+        fake_launch.assert_not_called()
+        self.assertTrue(controller._bridge_launch_ok)
+
+    def test_the_boot_close_explanation_changes_when_the_tray_is_turned_off(self):
+        controller, _ = self._make_controller(launched_at_logon=True)
+        controller.setClosePanelAfterBoot(True)
+        controller._tray_enabled = True
+        controller._tray_available = True
+        before = controller.closeAfterBootStatusText
+        self.assertIn("本次是登录自动启动", before)
+        controller.setTrayEnabled(False)
+        after = controller.closeAfterBootStatusText
+        self.assertIn("无法自动关闭", after)
+        self.assertNotEqual(before, after)
 
     def test_restore_defaults_resets_hotkey_and_trigger_mode(self):
         controller, _ = self._make_controller()

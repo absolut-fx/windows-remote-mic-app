@@ -275,7 +275,7 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
         single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
         app.main = lambda: self.fail("no-argument launch must never start the bridge")
         original_settings_main = settings_ui.main
-        settings_ui.main = lambda: None
+        settings_ui.main = lambda **kwargs: None
         sys.argv = ["ovb_rc003"]
 
         try:
@@ -318,7 +318,7 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
         single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
         app.main = lambda: self.fail("--settings must never call app.main()")
         original_settings_main = settings_ui.main
-        settings_ui.main = lambda: None
+        settings_ui.main = lambda **kwargs: None
         sys.argv = ["ovb_rc003", "--settings"]
 
         try:
@@ -329,6 +329,67 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
         self.assertEqual(enter_calls, [])
         # Non-vacuity: --settings must reach the settings window path.
         self.assertEqual(self.settings_guard_enters, [1])
+
+    def test_autostart_is_settings_with_the_logon_flag_set(self):
+        # --autostart is what the elevated scheduled task's action passes
+        # (elevated_autostart.LOGON_ARGUMENT). It must reach the SAME window
+        # path - including the settings single-instance guard, which is why it
+        # is resolved in the shared tail of main() rather than given its own
+        # early branch - and it must carry launched_at_logon=True, because
+        # that one boolean is the whole difference between "close the panel
+        # after boot up" firing and not firing.
+        from ovb_rc003 import settings_ui
+
+        enter_calls = []
+        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
+        app.main = lambda: self.fail("--autostart must never call app.main()")
+        seen_kwargs = []
+        original_settings_main = settings_ui.main
+        settings_ui.main = lambda **kwargs: seen_kwargs.append(kwargs)
+        sys.argv = ["ovb_rc003", "--autostart"]
+
+        try:
+            main_module.main()  # returns normally, no SystemExit
+        finally:
+            settings_ui.main = original_settings_main
+
+        self.assertEqual(enter_calls, [])
+        self.assertEqual(self.settings_guard_enters, [1])
+        self.assertEqual(seen_kwargs, [{"launched_at_logon": True}])
+
+    def test_plain_settings_launch_reports_launched_at_logon_false(self):
+        # The negative half of the test above: an ordinary launch must say so,
+        # or every manual start would close its own window.
+        from ovb_rc003 import settings_ui
+
+        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=[])
+        app.main = lambda: self.fail("no-argument launch must never start the bridge")
+        seen_kwargs = []
+        original_settings_main = settings_ui.main
+        settings_ui.main = lambda **kwargs: seen_kwargs.append(kwargs)
+        sys.argv = ["ovb_rc003"]
+
+        try:
+            main_module.main()
+        finally:
+            settings_ui.main = original_settings_main
+
+        self.assertEqual(seen_kwargs, [{"launched_at_logon": False}])
+
+    def test_the_autostart_flag_stays_in_sync_with_elevated_autostart(self):
+        # __main__.py dispatches on the literal "--autostart" (a literal on
+        # purpose - importing elevated_autostart at module level would pull
+        # its subprocess/PowerShell plumbing into every --help and bare
+        # launch's import graph). This is what keeps that literal from
+        # drifting away from the string the registration script actually
+        # passes: if the two disagree, the task keeps launching a flag nobody
+        # reads and "close the panel after boot up" silently stops firing.
+        import inspect
+
+        from ovb_rc003 import elevated_autostart
+
+        source = inspect.getsource(main_module)
+        self.assertIn(f'"{elevated_autostart.LOGON_ARGUMENT}" in args', source)
 
     def test_diagnose_ble_candidates_never_touches_the_guard(self):
         enter_calls = []
@@ -421,6 +482,20 @@ class DiagnoseBleCandidatesDispatchTests(_ArgvRestoringTestCase):
             main_module.main()  # returns normally, no SystemExit
 
         self.assertNotIn("--diagnose-ble-candidates", buffer.getvalue())
+
+    def test_help_text_never_mentions_the_hidden_autostart_flag(self):
+        # --autostart is an internal launch mode, not part of the public CLI
+        # surface: it exists so the Task Scheduler can mark a logon start. A
+        # user who typed it by hand would get a window that closes itself.
+        import io
+        import contextlib
+
+        sys.argv = ["ovb_rc003", "--help"]
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            main_module.main()  # returns normally, no SystemExit
+
+        self.assertNotIn("--autostart", buffer.getvalue())
 
 
 if __name__ == "__main__":

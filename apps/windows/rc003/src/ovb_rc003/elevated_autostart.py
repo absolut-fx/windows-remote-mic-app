@@ -66,6 +66,20 @@ logger = logging.getLogger(__name__)
 # competing for the device.
 TASK_NAME = "RemoteMicRC003-Elevated"
 
+# The one argument the scheduled task's action passes. It exists because a
+# logon start and a user double-click are otherwise byte-for-byte identical
+# invocations (``RemoteMicRC003.exe``, no arguments), so the app has no way to
+# tell them apart - and "close the panel after boot up" must fire on the
+# former and never on the latter. ``__main__.py`` routes it to the settings
+# window with ``launched_at_logon=True``.
+#
+# Changing this string therefore requires re-registering the task (an elevated
+# one-time step): an already-registered task keeps launching the bare exe until
+# ``register()`` runs again. That is why it is a named constant here rather
+# than an inline literal in the PowerShell script below - the registration
+# script and any reader share one definition.
+LOGON_ARGUMENT = "--autostart"
+
 _POWERSHELL = "powershell.exe"
 _POWERSHELL_TIMEOUT_S = 30.0
 
@@ -349,7 +363,9 @@ def register(
 
     ``target_exe`` is the app executable. The task runs it directly rather than
     going through a helper script in the user's home directory, so an installed
-    build is self-contained.
+    build is self-contained. It is launched with ``LOGON_ARGUMENT``
+    (``--autostart``) so the app can tell a logon start from a manual one -
+    see that constant for why that distinction is load-bearing.
     """
 
     resolved = Path(target_exe).resolve()
@@ -362,6 +378,7 @@ def register(
     exe = _ps_quote(str(resolved))
     work_dir = _ps_quote(str(resolved.parent))
     task = _ps_quote(TASK_NAME)
+    logon_argument = _ps_quote(LOGON_ARGUMENT)
 
     script = (
         f"$taskName = '{task}'; "
@@ -370,6 +387,7 @@ def register(
         f"Unregister-ScheduledTask -TaskName $taskName -Confirm:$false "
         f"-ErrorAction SilentlyContinue; "
         f"$action = New-ScheduledTaskAction -Execute '{exe}' "
+        f"-Argument '{logon_argument}' "
         f"-WorkingDirectory '{work_dir}'; "
         f"$trigger = New-ScheduledTaskTrigger -AtLogOn; "
         # RunLevel Highest is the whole point: the Task Scheduler service starts

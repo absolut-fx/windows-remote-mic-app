@@ -11,9 +11,12 @@
     no GUI/BLE/HID/audio, exits 0) so a broken build is caught here rather
     than only discovered on a real machine.
 
-    Does NOT fetch Frida Gadget, does NOT request elevation, and does NOT
-    sign the resulting binary. The optional VB-CABLE helper is downloaded
-    only by the explicit, hash-pinned fetch step below.
+    Does NOT request elevation and does NOT sign the resulting binary. It DOES
+    fetch both hash-pinned build inputs - the optional VB-CABLE helper pack and
+    the Frida Gadget archive - because the spec bundles them into the frozen
+    output and a missing gadget archive produces a build that starts, connects,
+    looks healthy, and has dead Vol+/Vol-/Back keys. Both fetches are required
+    gates: a download failure or hash mismatch fails the build closed.
 
     Exit-code gating (XRBM-014 review RETRY P2 #3): PowerShell's
     ``$ErrorActionPreference = "Stop"`` only turns PowerShell-cmdlet errors
@@ -91,7 +94,7 @@ try {
     # discovering everything was unrunnable. All of those reasons are fixed
     # now, so the subset - and the PowerShell array-splatting workaround it
     # needed in order to pass dotted test IDs as bare arguments - is gone.
-    # Re-measured 2026-09-16, all 1119 tests, 0 failures:
+    # Re-measured 2026-09-17, all 1176 tests, 0 failures (skipped=8):
     #   - test_tray_icon used to abort the ENTIRE run with 0xC0000409 and no
     #     output at all. FIXED: an earlier module's bare QGuiApplication could
     #     not host the tray's QMenu - every test module now obtains its app
