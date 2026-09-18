@@ -5,6 +5,16 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                 behavior, so a user who runs the exe always sees a window.
                 Never touches BLE/HID/audio or the single-instance guard.
 - ``--settings``  open the settings window (explicit form of the default)
+- ``--autostart`` HIDDEN, not in ``--help``: the settings window with
+                  "started at logon" set. The elevated at-logon scheduled
+                  task's action passes exactly this (see
+                  ``elevated_autostart.LOGON_ARGUMENT``) because the bare
+                  invocation is otherwise indistinguishable from a user
+                  double-clicking the exe - and the "close the panel after
+                  boot up" option must fire on the logon start and never on a
+                  manual one. Behaves exactly like ``--settings`` in every
+                  other respect, including the settings-mode single-instance
+                  guard below.
 - ``--bridge``  run the bridge - guarded by a per-session Windows named-
                 mutex (single_instance.py) so a second concurrent launch
                 never starts BLE/HID/audio: it shows a visible notice and
@@ -49,7 +59,7 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                   part of this program's public CLI surface.
 - ``--help``/``-h``  print this usage and exit 0
 
-``--settings``, ``--bridge``, ``--dry-run``,
+``--settings``, ``--autostart``, ``--bridge``, ``--dry-run``,
 ``--diagnose-ble-candidates`` and ``--help``/``-h`` are all checked and
 dispatched BEFORE the bridge branch below is ever reached, so none of them
 touch the single-instance mutex at all (XRBM-021 changed threat model: the
@@ -177,9 +187,14 @@ def _run_bridge() -> None:
         raise SystemExit(single_instance.CLEANUP_FAILED_EXIT_CODE)
 
 
-def _run_settings_window() -> None:
-    """Default / --settings path: open the settings window under the
-    settings-mode single-instance mutex.
+def _run_settings_window(*, launched_at_logon: bool = False) -> None:
+    """Default / --settings / --autostart path: open the settings window
+    under the settings-mode single-instance mutex.
+
+    ``launched_at_logon`` is True only for ``--autostart``, i.e. the launch the
+    elevated scheduled task makes. It is forwarded to the window so the
+    "close the panel after boot up" option can act on a logon start without
+    ever acting on a manual one.
 
     Mirrors ``_run_bridge``'s guard-fail-closed contract (XRBM-021 review
     round 1 P1 #1) applied to a different named mutex:
@@ -199,7 +214,7 @@ def _run_settings_window() -> None:
 
     try:
         with single_instance.SettingsInstanceGuard():
-            settings_ui.main()
+            settings_ui.main(launched_at_logon=launched_at_logon)
     except single_instance.DuplicateInstanceError as exc:
         single_instance.show_bridge_startup_blocked_notice(str(exc))
         raise SystemExit(single_instance.DUPLICATE_INSTANCE_EXIT_CODE)
@@ -265,7 +280,12 @@ def main() -> None:
     # never a headless bridge process with no UI. The window itself is
     # guarded so a second concurrent launch exits cleanly instead of
     # opening a duplicate settings window.
-    _run_settings_window()
+    #
+    # --autostart is that same window with the logon fact attached. It is
+    # resolved HERE rather than given its own early branch above on purpose:
+    # an early branch would return before the settings single-instance guard,
+    # so a logon launch racing a manual one could open two windows.
+    _run_settings_window(launched_at_logon="--autostart" in args)
 
 
 if __name__ == "__main__":

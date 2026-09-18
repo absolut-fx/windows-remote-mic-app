@@ -150,6 +150,69 @@ Item {
                 }
             }
 
+            // -- Close-the-panel-after-boot toggle ---------------------------
+            // Only meaningful together with the start-with-Windows toggle
+            // above, so it sits directly under it.
+            Rectangle {
+                Layout.fillWidth: true
+                radius: tokens.cornerRadiusLarge
+                color: tokens.surface
+                border.color: tokens.border
+                border.width: 1
+                implicitHeight: closeAfterBootColumn.implicitHeight + tokens.spacingLarge * 2
+
+                ColumnLayout {
+                    id: closeAfterBootColumn
+                    anchors.fill: parent
+                    anchors.margins: tokens.spacingLarge
+                    spacing: tokens.spacingSmall
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label {
+                            text: qsTr("开机启动后自动关闭设置窗口")
+                            font.pixelSize: tokens.fontSizeTitle
+                            font.bold: true
+                            color: tokens.textPrimary
+                            Layout.fillWidth: true
+                        }
+                        Switch {
+                            id: closeAfterBootSwitch
+                            objectName: "closePanelAfterBootSwitch"
+                            text: ""
+                            // Two-way binding with the same when-not-pressed
+                            // guard as the start-with-Windows switch above -
+                            // a one-way binding gets broken by the imperative
+                            // assignment Switch performs on click.
+                            checked: SettingsController.closePanelAfterBoot
+                            onCheckedChanged: {
+                                if (checked !== SettingsController.closePanelAfterBoot
+                                        && !pressed) {
+                                    SettingsController.setClosePanelAfterBoot(checked)
+                                }
+                            }
+                            Accessible.name: qsTr("开机启动后自动关闭设置窗口")
+                        }
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: qsTr(
+                            "仅对登录自动启动生效：桥接启动成功后，设置窗口会隐藏到系统托盘，程序继续在后台运行（不会退出，也不会停止桥接），单击托盘图标可重新打开。手动打开设置窗口不受影响。桥接启动失败时窗口会保留，以便查看原因。需要托盘图标可用。"
+                        )
+                        color: tokens.textSecondary
+                        font.pixelSize: tokens.fontSizeSmall
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: SettingsController.closeAfterBootStatusText
+                        color: tokens.textSecondary
+                        font.pixelSize: tokens.fontSizeSmall
+                    }
+                }
+            }
+
             // NOTE: the "登录后后台运行调度桥" (bridge autostart) card used to sit
             // here. It bound SettingsController.bridgeAutoStart,
             // .bridgeAutoStartStatusText and .bridgeAutoStartStatusIsError -

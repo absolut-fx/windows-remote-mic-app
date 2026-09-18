@@ -729,6 +729,8 @@ def _load_qt_classes() -> dict:
         trayEnabledChanged = Signal()
         trayAvailableChanged = Signal()
         trayStatusTextChanged = Signal()
+        closePanelAfterBootChanged = Signal()
+        closeAfterBootStatusTextChanged = Signal()
         startWithWindowsChanged = Signal()
         startWithWindowsStatusTextChanged = Signal()
         startWithWindowsStatusIsErrorChanged = Signal()
@@ -745,9 +747,21 @@ def _load_qt_classes() -> dict:
         _TRIGGER_MODE_ORDER = tuple(key_mapping.VoiceTriggerMode)
         _DEVICE_ORDER = tuple(profile.device_id for profile in device_catalog.DEVICE_PROFILES)
 
-        def __init__(self, model: "ButtonMappingModel", parent=None) -> None:
+        def __init__(
+            self,
+            model: "ButtonMappingModel",
+            parent=None,
+            *,
+            launched_at_logon: bool = False,
+        ) -> None:
             super().__init__(parent)
             self._model = model
+            # True only for the scheduled task's ``--autostart`` launch (see
+            # elevated_autostart.LOGON_ARGUMENT). An explicit constructor
+            # argument rather than a module global or an env var, so a test
+            # can build both kinds of launch in one process and assert the
+            # difference between them.
+            self._launched_at_logon = bool(launched_at_logon)
             self._config_root = config.config_root()
             self._config = config.load_config(config.config_path(self._config_root))
             self._bindings = config.load_key_bindings(
@@ -785,6 +799,10 @@ def _load_qt_classes() -> dict:
             self._hotkey_capture = None
             self._hotkeyCaptureResult.connect(self._on_hotkey_capture_result)
             self._bridge_handle: Optional[bridge_launcher.BridgeHandle] = None
+            # Written by _auto_launch_bridge. Starts True because "no launch
+            # has been attempted yet" is not a failure - and the boot-close
+            # policy only ever reads it after that method has run.
+            self._bridge_launch_ok: bool = True
 
             self._tray_enabled: bool = bool(
                 self._config.get("tray_enabled", True)
@@ -792,6 +810,16 @@ def _load_qt_classes() -> dict:
             self._tray_controller: Optional["tray_icon.TrayController"] = None
             self._tray_available: bool = False
             self._tray_status_text: str = ""
+            # "Close the panel after boot up". Read with the same
+            # get-with-default idiom as ``tray_enabled`` just above rather
+            # than being added to config.default_config(): an existing
+            # config.json then needs no migration, and the default lives in
+            # exactly one place. False = today's behaviour, the window stays
+            # open; an option that changes existing behaviour must be
+            # opt-in, not opt-out.
+            self._close_after_boot: bool = bool(
+                self._config.get("close_panel_after_boot", False)
+            )
             # start-with-Windows state now lives in the elevated scheduled
             # task ``RemoteMicRC003-Elevated`` rather than in a Startup-folder
             # shortcut, so reading it costs a ``powershell.exe`` spawn
@@ -864,6 +892,11 @@ def _load_qt_classes() -> dict:
             # click "保存并启动桥接" to hear voice; that button now serves
             # only as a "restart bridge" lever after settings changes.
             self._auto_launch_bridge()
+            # ...and, for a logon launch the user has opted in, get the window
+            # out of the way. Deliberately AFTER the bridge start above: the
+            # window is the only place the launch result is visible, so
+            # hiding first would hide the evidence that it failed.
+            self._apply_close_after_boot_policy()
 
         def _auto_launch_bridge(self) -> None:
             """Start the bridge in-process without requiring a save click.
@@ -877,6 +910,9 @@ def _load_qt_classes() -> dict:
                 self._set_launch_status(
                     "DJI Mic 2 使用 Windows 系统录音输入，不启动 RC003 BLE/HID/ATVV 桥。"
                 )
+                # Nothing was attempted, so nothing failed - the boot-close
+                # policy must not treat "no bridge by design" as an error.
+                self._bridge_launch_ok = True
                 return
             self._set_launch_status("正在启动…")
             result = bridge_launcher.launch_bridge()
@@ -884,7 +920,47 @@ def _load_qt_classes() -> dict:
                 self._bridge_handle = result.handle
                 register_bridge_handle(result.handle)
             self._set_launch_status(settings_ui.describe_launch_result(result))
+            # ALREADY_RUNNING counts as OK: the single-instance guard refused
+            # this second process, which means the bridge is up under the
+            # first one. QUICK_EXIT and LAUNCH_FAILED are the two outcomes
+            # that leave the user with a remote that does not work - see
+            # settings_ui.should_hide_window_after_logon.
+            self._bridge_launch_ok = result.outcome in (
+                bridge_launcher.LaunchOutcome.STARTED,
+                bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
+            )
             self.bridgeRunningChanged.emit()
+
+        def _apply_close_after_boot_policy(self) -> None:
+            """Hide the settings window after a logon autostart, if and only
+            if the user asked for it and it is safe to do so.
+
+            Runs once, from ``apply_runtime``, immediately after the bridge
+            auto-launch. Hiding is the same operation the window's own close
+            button performs while the tray icon is on (``_WindowEventFilter``
+            calls ``window.hide()``) - the process keeps running, the tray
+            icon stays, and the in-process bridge is untouched.
+            """
+            if not settings_ui.should_hide_window_after_logon(
+                launched_at_logon=self._launched_at_logon,
+                close_after_boot=self._close_after_boot,
+                tray_enabled=self._tray_enabled,
+                tray_available=self._tray_available,
+                bridge_start_ok=self._bridge_launch_ok,
+            ):
+                return
+            window = getattr(self, "_runtime_window", None)
+            if window is None:
+                return
+            try:
+                window.hide()
+            except Exception:  # noqa: BLE001
+                logger.exception("logon: failed to hide the settings window")
+                return
+            logger.info(
+                "logon: settings window hidden to tray "
+                "(close_panel_after_boot is on)"
+            )
 
         def _apply_tray_to_runtime(self) -> None:
             """Show or hide the system tray icon according to
@@ -930,6 +1006,10 @@ def _load_qt_classes() -> dict:
             self.trayEnabledChanged.emit()
             self.trayAvailableChanged.emit()
             self.trayStatusTextChanged.emit()
+            # tray_available is one of the two inputs the boot-close policy
+            # gates on, and it is only known after show() above - so the
+            # explanation is refreshed here, not just when the flag changes.
+            self.closeAfterBootStatusTextChanged.emit()
 
         def _on_tray_show_window(self) -> None:
             window = getattr(self, "_runtime_window", None)
@@ -1100,12 +1180,46 @@ def _load_qt_classes() -> dict:
             self._config["tray_enabled"] = target
             self._save_config()
             self._apply_tray_to_runtime()
+            # Turning the tray off is exactly what makes "close the panel
+            # after boot up" unenforceable, so its explanation has to change
+            # with it rather than keep claiming the window will close.
+            self.closeAfterBootStatusTextChanged.emit()
 
         def _get_tray_available(self) -> bool:
             return self._tray_available
 
         def _get_tray_status_text(self) -> str:
             return self._tray_status_text
+
+        def _get_close_after_boot(self) -> bool:
+            return self._close_after_boot
+
+        def _set_close_after_boot(self, value: bool) -> None:
+            target = bool(value)
+            if target == self._close_after_boot:
+                return
+            self._close_after_boot = target
+            self._config["close_panel_after_boot"] = target
+            self._save_config()
+            self.closePanelAfterBootChanged.emit()
+            # The explanation depends on the tray state as well as this flag,
+            # so it is re-emitted here even though the flag is the only thing
+            # that changed.
+            self.closeAfterBootStatusTextChanged.emit()
+
+        def _get_close_after_boot_status_text(self) -> str:
+            """What will actually happen, including the two states in which
+            this option cannot be honoured (no tray, so no way back to the
+            window). Delegates to the pure helper so every combination is
+            unit-tested without a window - see
+            ``settings_ui.describe_close_after_boot_policy``.
+            """
+            return settings_ui.describe_close_after_boot_policy(
+                launched_at_logon=self._launched_at_logon,
+                close_after_boot=self._close_after_boot,
+                tray_enabled=self._tray_enabled,
+                tray_available=self._tray_available,
+            )
 
         def _get_start_with_windows(self) -> bool:
             return self._start_with_windows
@@ -1261,6 +1375,10 @@ def _load_qt_classes() -> dict:
             self._set_start_with_windows(value)
 
         @Slot()
+        def setClosePanelAfterBoot(self, value: bool) -> None:  # noqa: N802
+            self._set_close_after_boot(value)
+
+        @Slot()
         def refreshStartWithWindowsStatus(self) -> None:  # noqa: N802
             """QML can call this on window show to re-read the on-disk
             state in case the shortcut was removed out-of-band."""
@@ -1275,6 +1393,17 @@ def _load_qt_classes() -> dict:
         trayAvailable = Property(bool, _get_tray_available, notify=trayAvailableChanged)
         trayStatusText = Property(
             str, _get_tray_status_text, notify=trayStatusTextChanged
+        )
+        closePanelAfterBoot = Property(
+            bool,
+            _get_close_after_boot,
+            _set_close_after_boot,
+            notify=closePanelAfterBootChanged,
+        )
+        closeAfterBootStatusText = Property(
+            str,
+            _get_close_after_boot_status_text,
+            notify=closeAfterBootStatusTextChanged,
         )
         startWithWindows = Property(
             bool,
@@ -2400,13 +2529,19 @@ _QML_MAPPING_MODEL_TYPE_NAME = "ButtonMappingModel"
 _QML_DIAGNOSTICS_TYPE_NAME = "DiagnosticsController"  # XRBM-031
 
 
-def run_settings_window() -> int:
+def run_settings_window(*, launched_at_logon: bool = False) -> int:
     """Builds and runs the Qt Quick/QML settings window. Blocks until the
     window is closed (``QGuiApplication.exec()``), then returns its exit
     code. Raises ``QtUnavailableError`` (via ``_load_qt_classes()``) if
     PySide6-Essentials is not installed, or if ``main.qml`` fails to load at
     all (e.g. a corrupted/incomplete frozen build missing its bundled qml/
     directory) - never silently opens a blank/broken window.
+
+    ``launched_at_logon`` is True only when ``__main__`` saw ``--autostart``,
+    i.e. the launch the elevated scheduled task makes. It reaches
+    ``SettingsController`` as an explicit argument (never a module global) so
+    the "close the panel after boot up" behaviour is a property of one
+    specific launch, not of the process environment.
     """
 
     classes = _load_qt_classes()
@@ -2457,7 +2592,7 @@ def run_settings_window() -> int:
         app.setStyle("Fusion")
 
     model = ButtonMappingModel()
-    controller = SettingsController(model)
+    controller = SettingsController(model, launched_at_logon=launched_at_logon)
     diagnostics_controller = DiagnosticsController(controller, config.config_root())
 
     # XRBM-035 RETRY 1 P2: DiagnosticsController's own __init__() (just

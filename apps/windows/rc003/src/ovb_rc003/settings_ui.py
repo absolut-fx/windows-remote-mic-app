@@ -446,18 +446,122 @@ def describe_log_open_result(result: logging_setup.LogOpenResult) -> str:
     return f"无法打开日志（{result.error}）：{result.location.file_path}"
 
 
-def main() -> None:
+# ---------------------------------------------------------------------------
+# Logon-autostart window policy ("close the panel after boot up")
+# ---------------------------------------------------------------------------
+#
+# At logon the elevated scheduled task launches this exe with
+# ``--autostart`` (see ``elevated_autostart.LOGON_ARGUMENT``). That is a
+# separate launch mode, not a decoration: without the flag a logon start is
+# byte-for-byte identical to a user double-clicking the icon, so the app
+# cannot tell them apart and must not behave differently.
+#
+# The window a logon start opens is useful exactly once - to show that the
+# bridge came up - and after that it is just something sitting on the
+# desktop. The option below closes it automatically. What "close" means
+# matters: it is the same thing clicking the X already does while the tray
+# icon is on, i.e. hide to the tray. It is deliberately NOT "quit", because
+# the window OWNS the bridge subprocess: `_auto_launch_bridge` starts it as
+# a separate process (bridge_launcher.launch_bridge -> `[exe, "--bridge"]`)
+# and the window's own shutdown stops it again
+# (qt_settings_app._shutdown_qt_settings_app_at_exit -> stop_bridge), so
+# quitting would tear down the BLE/HID/ATVV pipeline that booting the app
+# exists to start.
+#
+# Gating: hiding is only safe while there is a way back to the window. With
+# the tray disabled - or enabled but unavailable on this host - there is
+# none, and the app would become a process with no window and no icon. The
+# policy therefore refuses, and the UI says why rather than silently doing
+# nothing. Every bounded policy needs an answer for the state where it
+# cannot be enforced; this is that answer, and it is tested.
+
+
+def should_hide_window_after_logon(
+    *,
+    launched_at_logon: bool,
+    close_after_boot: bool,
+    tray_enabled: bool,
+    tray_available: bool,
+    bridge_start_ok: bool,
+) -> bool:
+    """True iff the settings window should hide itself right after a logon
+    autostart.
+
+    All inputs are explicit so every combination - including the states where
+    the policy cannot or must not be enforced - is directly testable without
+    constructing a window. ``tray_available`` is the host's live answer
+    (``tray_icon.TrayController.show()`` returned truthy), not the user's
+    preference: a machine whose tray service is missing must not lose its only
+    window.
+
+    ``bridge_start_ok`` is the outcome of the launch this same boot performed
+    (True for a start that succeeded, was already running, or was not attempted
+    by design - e.g. the DJI Mic 2 profile, which uses the Windows default
+    capture device and never starts the RC003 bridge). It exists because the
+    window is the ONLY place the launch result is visible: auto-hiding it after
+    a failed launch would hide the one piece of evidence explaining why the
+    remote does not work. An option whose job is "get out of the way" must not
+    get out of the way of a failure.
+    """
+
+    if not launched_at_logon:
+        return False
+    if not close_after_boot:
+        return False
+    if not bridge_start_ok:
+        return False
+    return bool(tray_enabled and tray_available)
+
+
+def describe_close_after_boot_policy(
+    *,
+    launched_at_logon: bool,
+    close_after_boot: bool,
+    tray_enabled: bool,
+    tray_available: bool,
+) -> str:
+    """One line explaining what will actually happen, for the settings UI.
+
+    Mirrors ``describe_launch_result``'s wording contract: it describes the
+    mechanism, and never claims the RC003 is connected.
+    """
+
+    if not close_after_boot:
+        return "关闭：登录自动启动后设置窗口会保持打开，需要手动关闭。"
+    if not (tray_enabled and tray_available):
+        return (
+            "无法自动关闭：本机没有可用的系统托盘图标，隐藏设置窗口后就没有办法"
+            "再打开它（关闭窗口还会一并退出程序、停止桥接）。请先启用上面的"
+            "“启用系统托盘图标”。"
+        )
+    if not launched_at_logon:
+        return (
+            "已启用：仅在开机/登录自动启动时生效，本次是手动打开，窗口不会"
+            "自动关闭。"
+        )
+    return (
+        "已启用：本次是登录自动启动，桥接启动后窗口会自动隐藏到系统托盘，"
+        "桥接继续运行；单击托盘图标可重新打开。"
+    )
+
+
+def main(*, launched_at_logon: bool = False) -> None:
     """Launches the Qt Quick/QML settings window (XRBM-030). Imports
     ``qt_settings_app`` lazily so importing THIS module (e.g. from
     ``__main__.py``'s ``--dry-run`` smoke check, or from any test that only
     needs the pure functions above) never requires PySide6 to be installed -
     see ``qt_settings_app.py``'s module docstring for the exact, clear error
     raised here if it is missing.
+
+    ``launched_at_logon`` is passed straight through from
+    ``__main__._run_settings_window`` - True only for the ``--autostart``
+    launch the scheduled task makes, so "close the panel after boot up"
+    cannot fire on an ordinary manual start.
     """
 
     from . import qt_settings_app
 
-    qt_settings_app.run_settings_window()
+    qt_settings_app.run_settings_window(launched_at_logon=launched_at_logon)
 
 
 if __name__ == "__main__":

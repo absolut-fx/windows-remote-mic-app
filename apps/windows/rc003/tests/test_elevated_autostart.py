@@ -220,6 +220,37 @@ class RegisterTests(unittest.TestCase):
         self.assertIn(str(Path(sys.executable).resolve()), script)
         self.assertIn(str(Path(sys.executable).resolve().parent), script)
 
+    def test_registration_passes_the_logon_argument(self):
+        """The task's action must pass ``LOGON_ARGUMENT``.
+
+        A bare ``RemoteMicRC003.exe`` invocation is byte-for-byte identical
+        whether the Task Scheduler started it at logon or the user
+        double-clicked it, so without this argument the app cannot tell the
+        two apart - and the "close the panel after boot up" option would
+        either never fire or fire on manual launches too. The assertion is
+        that the VALUE reaches the action, not merely that the constant
+        exists: a constant nobody passes changes nothing.
+        """
+        runner = _RecordingRunner("OK")
+        ea.register(Path(sys.executable), runner=runner)
+        script = runner.calls[-1][0]
+
+        self.assertIn("New-ScheduledTaskAction", script)
+        self.assertIn(f"-Argument '{ea.LOGON_ARGUMENT}'", script)
+        # ...and on the same action as the executable, not floating loose.
+        action_index = script.index("New-ScheduledTaskAction")
+        argument_index = script.index(f"-Argument '{ea.LOGON_ARGUMENT}'")
+        working_dir_index = script.index("-WorkingDirectory")
+        self.assertLess(action_index, argument_index)
+        self.assertLess(argument_index, working_dir_index)
+
+    def test_the_logon_argument_is_not_empty_and_looks_like_a_flag(self):
+        # Guard against the constant being blanked out, which would silently
+        # produce `-Argument ''` - a task that still launches the bare exe.
+        self.assertTrue(ea.LOGON_ARGUMENT.startswith("--"))
+        self.assertGreater(len(ea.LOGON_ARGUMENT), 2)
+        self.assertNotIn(" ", ea.LOGON_ARGUMENT)
+
     def test_registration_clears_a_previous_task_first(self):
         """Re-registering after a move/upgrade must not leave a stale action
         pointing at the old install path."""

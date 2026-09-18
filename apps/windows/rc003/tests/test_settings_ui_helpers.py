@@ -20,11 +20,114 @@ from ovb_rc003.settings_ui import (
     _parse_endpoint_display,
     build_save_model,
     default_display_state,
+    describe_close_after_boot_policy,
     describe_launch_result,
     describe_log_open_result,
     describe_stop_result,
+    should_hide_window_after_logon,
     voice_hotkey_for_trigger_mode,
 )
+
+
+class ClosePanelAfterBootPolicyTests(unittest.TestCase):
+    """The logon-autostart window policy behind the settings option "close
+    the panel after boot up".
+
+    Every input is an explicit keyword argument precisely so all 2**5
+    combinations - not just the happy one - are assertable here, without a
+    window, a tray, or a launch. The two states that matter most are the ones
+    where the policy must REFUSE: no tray icon (hiding the only window would
+    leave an unreachable process) and a failed bridge start (the window is the
+    only place that failure is visible).
+    """
+
+    _GOOD = dict(
+        launched_at_logon=True,
+        close_after_boot=True,
+        tray_enabled=True,
+        tray_available=True,
+        bridge_start_ok=True,
+    )
+
+    def _decide(self, **overrides):
+        return should_hide_window_after_logon(**{**self._GOOD, **overrides})
+
+    def _text(self, **overrides):
+        # describe_close_after_boot_policy() deliberately does NOT take the
+        # runtime bridge outcome: it explains the POLICY for the settings page
+        # - a static statement - not what just happened during a boot. Drop
+        # the key here rather than widening that function's contract.
+        merged = {**self._GOOD, **overrides}
+        merged.pop("bridge_start_ok", None)
+        return describe_close_after_boot_policy(**merged)
+
+    def test_hides_only_when_every_condition_holds(self):
+        self.assertTrue(self._decide())
+
+    def test_never_hides_on_a_manual_launch(self):
+        # The whole reason --autostart exists: a user who double-clicks the
+        # exe must get a window that stays.
+        self.assertFalse(self._decide(launched_at_logon=False))
+
+    def test_never_hides_when_the_option_is_off(self):
+        self.assertFalse(self._decide(close_after_boot=False))
+
+    def test_refuses_when_the_tray_preference_is_off(self):
+        self.assertFalse(self._decide(tray_enabled=False))
+
+    def test_refuses_when_the_host_has_no_usable_tray(self):
+        # tray_enabled=True but the host could not provide an icon
+        # (TrayController.show() returned falsy). Preference is not
+        # availability, and only availability decides whether there is a way
+        # back to the window.
+        self.assertFalse(self._decide(tray_available=False))
+
+    def test_refuses_after_a_failed_bridge_start(self):
+        self.assertFalse(self._decide(bridge_start_ok=False))
+
+    def test_a_failed_start_wins_over_an_otherwise_perfect_configuration(self):
+        # Ordering check: even with the option on, the tray up, and a genuine
+        # logon launch, the failure gate alone must veto.
+        self.assertFalse(
+            self._decide(
+                launched_at_logon=True,
+                close_after_boot=True,
+                tray_enabled=True,
+                tray_available=True,
+                bridge_start_ok=False,
+            )
+        )
+
+    def test_every_single_input_can_turn_the_decision_off(self):
+        # Non-vacuity for the whole table: if any one input were ignored by
+        # the implementation, one of these would still be True.
+        for key in ("launched_at_logon", "close_after_boot", "bridge_start_ok"):
+            with self.subTest(input=key):
+                self.assertFalse(self._decide(**{key: False}))
+        for key in ("tray_enabled", "tray_available"):
+            with self.subTest(input=key):
+                self.assertFalse(self._decide(**{key: False}))
+
+    def test_policy_text_always_explains_the_current_state(self):
+        cases = (
+            (dict(close_after_boot=False), "关闭："),
+            (dict(tray_enabled=False), "无法自动关闭"),
+            (dict(tray_available=False), "无法自动关闭"),
+            (dict(launched_at_logon=False), "仅在开机/登录自动启动时生效"),
+            (dict(), "本次是登录自动启动"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                text = self._text(**overrides)
+                self.assertIn(expected, text)
+
+    def test_policy_text_never_claims_the_device_is_connected(self):
+        # Same wording contract as describe_launch_result: the text may say
+        # the window hides, never that the RC003 connected - that is only
+        # observable from app.log.
+        text = self._text()
+        self.assertNotIn("已连接", text)
+        self.assertNotIn("connected", text.lower())
 
 
 class DisplayRoundTripTests(unittest.TestCase):
