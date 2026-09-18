@@ -1012,6 +1012,19 @@ class RC003App:
                 win32_input.send_voice_key_combo_down(tokens)
             else:
                 win32_input.send_voice_key_combo_up(tokens)
+            # Log the emission, not just the failures. The voice transport is
+            # `keybd_event`, which returns void and cannot report a delivery
+            # failure, so without this line the bridge log cannot distinguish
+            # "sent and the host ignored it" from "never sent at all" - and a
+            # host-side hook that silently rejects the chord leaves no trace on
+            # either side. Measured 2026-09-18: 205 sessions emitted, only 70
+            # admissions in the host's log, with no way to tell them apart.
+            self._logger.info(
+                "voice host shortcut sent: %s %s via %s",
+                action.value,
+                "+".join(tokens),
+                win32_input.voice_backend_name(),
+            )
             return True
         except win32_input.Win32InputUnavailableError:
             self._logger.info("voice hotkey action skipped: no usable voice input backend")
